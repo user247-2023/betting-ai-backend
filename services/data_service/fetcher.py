@@ -6,12 +6,17 @@ Single source of truth for all match data.
 import httpx
 import json
 import os
+import time
 from typing import List, Dict, Optional
 from datetime import datetime
 
 
 class DataService:
     """Fetches and normalises football data from multiple sources."""
+
+    # Class-level cache shared across all instances
+    _fixture_cache: Dict[str, Dict] = {}
+    CACHE_TTL_SECONDS = 1800  # 30 minutes
 
     def __init__(self):
         self.api_football_key = os.getenv("API_FOOTBALL_KEY", "")
@@ -35,7 +40,14 @@ class DataService:
 
     # ── FIXTURES ─────────────────────────────────────────────────
     async def get_fixtures(self, date: str) -> List[Dict]:
-        """Fetch today's fixtures from API-Football, filtered by allowed leagues."""
+        """Fetch today's fixtures from API-Football, filtered by allowed leagues. Cached for 30 min."""
+        # Check cache first to save API quota
+        if date in self._fixture_cache:
+            cached = self._fixture_cache[date]
+            if time.time() - cached["timestamp"] < self.CACHE_TTL_SECONDS:
+                print(f"[DataService] Using cached fixtures for {date}")
+                return cached["data"]
+
         if not self.api_football_key:
             return []
 
@@ -46,6 +58,10 @@ class DataService:
                     headers={"x-apisports-key": self.api_football_key}
                 )
                 data = r.json()
+                # Log quota info if present
+                remaining = r.headers.get("x-ratelimit-requests-remaining")
+                if remaining:
+                    print(f"[DataService] API quota remaining: {remaining}")
             except Exception as e:
                 print(f"[DataService] Fixtures fetch error: {e}")
                 return []
@@ -84,6 +100,12 @@ class DataService:
                 "venue": f.get("fixture", {}).get("venue", {}).get("name", ""),
                 "status": status,
             })
+
+        # Save to cache
+        self._fixture_cache[date] = {
+            "data": fixtures,
+            "timestamp": time.time(),
+        }
 
         return fixtures
 
