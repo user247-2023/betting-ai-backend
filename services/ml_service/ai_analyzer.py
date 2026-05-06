@@ -52,7 +52,8 @@ class AIAnalyzer:
 
     # ── Individual AI callers ────────────────────────────────────
     async def _call_claude(self, prompt: str) -> str:
-        if not self.claude_key:
+        key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not key:
             return ""
         async with httpx.AsyncClient(timeout=30) as c:
             try:
@@ -60,7 +61,7 @@ class AIAnalyzer:
                     "https://api.anthropic.com/v1/messages",
                     headers={
                         "Content-Type": "application/json",
-                        "x-api-key": self.claude_key,
+                        "x-api-key": key,
                         "anthropic-version": "2023-06-01",
                     },
                     json={
@@ -77,13 +78,14 @@ class AIAnalyzer:
                 return f"ERR:{e}"
 
     async def _call_gemini(self, prompt: str) -> str:
-        if not self.gemini_key:
+        key = os.getenv("GEMINI_API_KEY", "")
+        if not key:
             return ""
         async with httpx.AsyncClient(timeout=30) as c:
             try:
                 r = await c.post(
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-2.0-flash:generateContent?key={self.gemini_key}",
+                    f"gemini-2.0-flash:generateContent?key={key}",
                     headers={"Content-Type": "application/json"},
                     json={
                         "contents": [{"parts": [{"text": prompt}]}],
@@ -96,7 +98,8 @@ class AIAnalyzer:
                 return f"ERR:{e}"
 
     async def _call_groq(self, prompt: str) -> str:
-        if not self.groq_key:
+        key = os.getenv("GROQ_API_KEY", "")
+        if not key:
             return ""
         async with httpx.AsyncClient(timeout=30) as c:
             try:
@@ -104,7 +107,7 @@ class AIAnalyzer:
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={
                         "Content-Type": "application/json",
-                        "Authorization": f"Bearer {self.groq_key}",
+                        "Authorization": f"Bearer {key}",
                     },
                     json={
                         "model": "llama-3.3-70b-versatile",
