@@ -252,6 +252,12 @@ async def health():
             "ml": "Claude + Gemini + Groq",
             "decision": "Value + Rollover + Risk",
         },
+        "keys_loaded": {
+            "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
+            "gemini": bool(os.getenv("GEMINI_API_KEY")),
+            "groq": bool(os.getenv("GROQ_API_KEY")),
+            "api_football": bool(os.getenv("API_FOOTBALL_KEY")),
+        }
     }
 
 
