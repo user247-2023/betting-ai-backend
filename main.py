@@ -35,16 +35,10 @@ app = FastAPI(
     redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
 )
 
-# ── CORS — only allow your Vercel domain ────────────────────────
-ALLOWED_ORIGINS = [
-    "https://rollover-app-kohl.vercel.app",
-    "https://rollover-bmtfbmrbu-user247-2023s-projects.vercel.app",
-    "http://localhost:3000",  # local dev only
-    "http://localhost:5173",  # Vite dev server
-]
+# ── CORS — allow all Vercel deployments + local dev ─────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],  # Allow all origins — Railway auth key provides security
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
@@ -54,17 +48,21 @@ INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 
 async def verify_api_key(request: Request):
     """Check that requests come with the correct internal API key."""
-    # Allow health check without auth
+    # Always allow health check
     if request.url.path == "/api/health":
         return True
-
-    # Skip auth if no key configured (dev mode)
+    # If no INTERNAL_API_KEY configured, allow all (open mode)
     if not INTERNAL_API_KEY:
         return True
-
+    # Check header
     key = request.headers.get("X-API-Key", "")
+    # Also accept from query param as fallback
+    if not key:
+        key = request.query_params.get("key", "")
     if key != INTERNAL_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        # Log for debugging
+        print(f"Auth failed. Received key: '{key[:10]}...' Expected: '{INTERNAL_API_KEY[:10]}...'")
+        raise HTTPException(status_code=401, detail="Unauthorized - invalid API key")
     return True
 
 # ── Initialise Services ─────────────────────────────────────────
