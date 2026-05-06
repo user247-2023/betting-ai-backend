@@ -5,8 +5,11 @@ ROLLOVER BETTING AI - MAIN API
   2. ML Service       -> probability calibration + AI analysis
   3. Decision Engine  -> value detection + rollover filter + risk management
 """
-from fastapi import FastAPI, HTTPException
+import os
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -27,13 +30,42 @@ app = FastAPI(
     title="Rollover Betting AI",
     description="3-service betting intelligence system",
     version="3.0.0",
+    # Disable public docs in production for security
+    docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
+    redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
 )
+
+# ── CORS — only allow your Vercel domain ────────────────────────
+ALLOWED_ORIGINS = [
+    "https://rollover-app-kohl.vercel.app",
+    "https://rollover-bmtfbmrbu-user247-2023s-projects.vercel.app",
+    "http://localhost:3000",  # local dev only
+    "http://localhost:5173",  # Vite dev server
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+# ── API Key Authentication ───────────────────────────────────────
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+
+async def verify_api_key(request: Request):
+    """Check that requests come with the correct internal API key."""
+    # Allow health check without auth
+    if request.url.path == "/api/health":
+        return True
+
+    # Skip auth if no key configured (dev mode)
+    if not INTERNAL_API_KEY:
+        return True
+
+    key = request.headers.get("X-API-Key", "")
+    if key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
 
 # ── Initialise Services ─────────────────────────────────────────
 data_svc = DataService()
@@ -69,7 +101,7 @@ class BankrollUpdate(BaseModel):
 #                 Rollover Filter -> Strategy Decision
 # ══════════════════════════════════════════════════════════════════
 @app.post("/api/tips")
-async def get_tips(req: TipsRequest):
+async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
     today = req.date or datetime.utcnow().strftime("%Y-%m-%d")
 
     # ── STEP 1: Data Service - get real fixtures ─────────────────
