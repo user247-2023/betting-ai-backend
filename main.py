@@ -261,39 +261,51 @@ async def health():
 
 @app.get("/api/debug/ai")
 async def debug_ai():
-    """Test each AI directly with a simple prompt to see which ones work."""
+    """Test each AI directly with a simple prompt to see exactly what fails."""
     test_prompt = "Reply with only the word: WORKING"
-    results = {}
+    results = {
+        "env_check": {
+            "anthropic_key_length": len(os.getenv("ANTHROPIC_API_KEY", "")),
+            "gemini_key_length": len(os.getenv("GEMINI_API_KEY", "")),
+            "groq_key_length": len(os.getenv("GROQ_API_KEY", "")),
+            "anthropic_starts_with": os.getenv("ANTHROPIC_API_KEY", "")[:10] + "...",
+            "gemini_starts_with": os.getenv("GEMINI_API_KEY", "")[:10] + "...",
+            "groq_starts_with": os.getenv("GROQ_API_KEY", "")[:10] + "...",
+        }
+    }
 
     # Test Claude
     try:
         result = await ai_analyzer._call_claude(test_prompt)
         results["claude"] = {
             "status": "success" if result and not result.startswith("ERR:") else "failed",
-            "response": result[:200] if result else "empty",
+            "response_length": len(result) if result else 0,
+            "response_full": result if result else "EMPTY_STRING_RETURNED",
         }
     except Exception as e:
-        results["claude"] = {"status": "error", "response": str(e)[:200]}
+        results["claude"] = {"status": "exception", "error": f"{type(e).__name__}: {e}"}
 
     # Test Gemini
     try:
         result = await ai_analyzer._call_gemini(test_prompt)
         results["gemini"] = {
             "status": "success" if result and not result.startswith("ERR:") else "failed",
-            "response": result[:200] if result else "empty",
+            "response_length": len(result) if result else 0,
+            "response_full": result if result else "EMPTY_STRING_RETURNED",
         }
     except Exception as e:
-        results["gemini"] = {"status": "error", "response": str(e)[:200]}
+        results["gemini"] = {"status": "exception", "error": f"{type(e).__name__}: {e}"}
 
     # Test Groq
     try:
         result = await ai_analyzer._call_groq(test_prompt)
         results["groq"] = {
             "status": "success" if result and not result.startswith("ERR:") else "failed",
-            "response": result[:200] if result else "empty",
+            "response_length": len(result) if result else 0,
+            "response_full": result if result else "EMPTY_STRING_RETURNED",
         }
     except Exception as e:
-        results["groq"] = {"status": "error", "response": str(e)[:200]}
+        results["groq"] = {"status": "exception", "error": f"{type(e).__name__}: {e}"}
 
     return results
 
