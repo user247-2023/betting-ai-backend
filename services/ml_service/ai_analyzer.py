@@ -1,22 +1,124 @@
 """
-ai_analyzer.py - Calls 3 AIs in parallel to analyse fixtures.
-Bulletproof JSON parsing with 4 fallback strategies.
+ai_analyzer.py - Multi-AI football analysis
+Uses requests library + ThreadPoolExecutor for reliable parallel execution.
 """
-import httpx
-import asyncio
+import requests
 import json
 import re
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
 
-class AIAnalyzer:
-    """Sends fixtures to Claude, Gemini, and Groq for parallel analysis."""
+def _call_claude_sync(prompt: str) -> str:
+    """Synchronous Claude call - more reliable on Railway."""
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not key:
+        print("[Claude] No key in env")
+        return "ERR:no_key"
+    try:
+        print(f"[Claude] Calling with key starting {key[:12]}...")
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 4000,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=45,
+        )
+        print(f"[Claude] HTTP {r.status_code}")
+        if r.status_code != 200:
+            print(f"[Claude] Body: {r.text[:300]}")
+            return f"ERR:HTTP{r.status_code}:{r.text[:200]}"
+        d = r.json()
+        text = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text").strip()
+        print(f"[Claude] Got {len(text)} chars")
+        return text
+    except Exception as e:
+        print(f"[Claude] Exception: {type(e).__name__}: {e}")
+        return f"ERR:{type(e).__name__}:{e}"
 
-    def __init__(self):
-        self.claude_key = os.getenv("ANTHROPIC_API_KEY", "")
-        self.gemini_key = os.getenv("GEMINI_API_KEY", "")
-        self.groq_key = os.getenv("GROQ_API_KEY", "")
+
+def _call_gemini_sync(prompt: str) -> str:
+    """Synchronous Gemini call."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        print("[Gemini] No key in env")
+        return "ERR:no_key"
+    try:
+        print(f"[Gemini] Calling with key starting {key[:12]}...")
+        r = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}",
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 4000, "temperature": 0.1},
+            },
+            timeout=45,
+        )
+        print(f"[Gemini] HTTP {r.status_code}")
+        if r.status_code != 200:
+            print(f"[Gemini] Body: {r.text[:300]}")
+            return f"ERR:HTTP{r.status_code}:{r.text[:200]}"
+        d = r.json()
+        candidates = d.get("candidates", [])
+        if not candidates:
+            print(f"[Gemini] No candidates: {str(d)[:300]}")
+            return f"ERR:no_candidates:{str(d)[:200]}"
+        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        print(f"[Gemini] Got {len(text)} chars")
+        return text
+    except Exception as e:
+        print(f"[Gemini] Exception: {type(e).__name__}: {e}")
+        return f"ERR:{type(e).__name__}:{e}"
+
+
+def _call_groq_sync(prompt: str) -> str:
+    """Synchronous Groq call."""
+    key = os.getenv("GROQ_API_KEY", "").strip()
+    if not key:
+        print("[Groq] No key in env")
+        return "ERR:no_key"
+    try:
+        print(f"[Groq] Calling with key starting {key[:12]}...")
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {key}",
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": "Football analyst. Return ONLY a JSON array. Start [ end ]. No markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 4000,
+                "temperature": 0.1,
+            },
+            timeout=45,
+        )
+        print(f"[Groq] HTTP {r.status_code}")
+        if r.status_code != 200:
+            print(f"[Groq] Body: {r.text[:300]}")
+            return f"ERR:HTTP{r.status_code}:{r.text[:200]}"
+        d = r.json()
+        text = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"[Groq] Got {len(text)} chars")
+        return text
+    except Exception as e:
+        print(f"[Groq] Exception: {type(e).__name__}: {e}")
+        return f"ERR:{type(e).__name__}:{e}"
+
+
+class AIAnalyzer:
+    """Multi-AI football analyzer."""
 
     def _build_prompt(self, fixture_text: str, date: str) -> str:
         return (
@@ -50,97 +152,31 @@ class AIAnalyzer:
             '"reasoning":"Stats here.","key_stats":["s1","s2","s3","s4"],"risk":"LOW"}]'
         )
 
-    # ── Individual AI callers ────────────────────────────────────
+    # Async wrappers that just call the sync versions
     async def _call_claude(self, prompt: str) -> str:
-        key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not key:
-            return ""
-        async with httpx.AsyncClient(timeout=30) as c:
-            try:
-                r = await c.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "Content-Type": "application/json",
-                        "x-api-key": key,
-                        "anthropic-version": "2023-06-01",
-                    },
-                    json={
-                        "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 4000,
-                        "messages": [{"role": "user", "content": prompt}],
-                    },
-                )
-                d = r.json()
-                return "".join(
-                    b["text"] for b in d.get("content", []) if b.get("type") == "text"
-                ).strip()
-            except Exception as e:
-                return f"ERR:{e}"
+        return _call_claude_sync(prompt)
 
     async def _call_gemini(self, prompt: str) -> str:
-        key = os.getenv("GEMINI_API_KEY", "")
-        if not key:
-            return ""
-        async with httpx.AsyncClient(timeout=30) as c:
-            try:
-                r = await c.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"gemini-2.0-flash:generateContent?key={key}",
-                    headers={"Content-Type": "application/json"},
-                    json={
-                        "contents": [{"parts": [{"text": prompt}]}],
-                        "generationConfig": {"maxOutputTokens": 4000, "temperature": 0.1},
-                    },
-                )
-                d = r.json()
-                return d.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            except Exception as e:
-                return f"ERR:{e}"
+        return _call_gemini_sync(prompt)
 
     async def _call_groq(self, prompt: str) -> str:
-        key = os.getenv("GROQ_API_KEY", "")
-        if not key:
-            return ""
-        async with httpx.AsyncClient(timeout=30) as c:
-            try:
-                r = await c.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Authorization": f"Bearer {key}",
-                    },
-                    json={
-                        "model": "llama-3.3-70b-versatile",
-                        "messages": [
-                            {"role": "system", "content": "Football analyst. Return ONLY a JSON array. Start [ end ]. No markdown."},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "max_tokens": 4000,
-                        "temperature": 0.1,
-                    },
-                )
-                d = r.json()
-                return d.get("choices", [{}])[0].get("message", {}).get("content", "")
-            except Exception as e:
-                return f"ERR:{e}"
+        return _call_groq_sync(prompt)
 
     # ── Bulletproof JSON parser ──────────────────────────────────
     def _extract_tips(self, raw: str, ai_name: str) -> Tuple[List[Dict], str]:
         if not raw or len(raw) < 10 or raw.startswith("ERR:"):
-            return [], f"{ai_name}: {(raw or 'empty')[:80]}"
+            return [], f"{ai_name}: {(raw or 'empty')[:120]}"
 
         text = re.sub(r"```json\s*", "", raw)
         text = re.sub(r"```\s*", "", text).strip()
         arr = []
 
-        # Strategy 1: direct parse
         if text.startswith("["):
             try:
                 arr = json.loads(text)
             except json.JSONDecodeError:
                 pass
 
-        # Strategy 2: regex extract
         if not arr:
             m = re.search(r"\[[\s\S]*\]", text)
             if m:
@@ -149,7 +185,6 @@ class AIAnalyzer:
                 except json.JSONDecodeError:
                     pass
 
-        # Strategy 3: individual objects
         if not arr:
             objs = re.findall(r"\{[^{}]{20,}\}", text)
             for obj_str in objs:
@@ -158,7 +193,6 @@ class AIAnalyzer:
                 except json.JSONDecodeError:
                     pass
 
-        # Strategy 4: fix trailing commas
         if not arr:
             fixed = re.sub(r",\s*]", "]", text)
             fixed = re.sub(r",\s*}", "}", fixed)
@@ -170,7 +204,7 @@ class AIAnalyzer:
                     pass
 
         if not arr:
-            return [], f"{ai_name}: no JSON found ({text[:80]})"
+            return [], f"{ai_name}: no JSON ({text[:80]})"
 
         tips = []
         for t in arr:
@@ -235,19 +269,20 @@ class AIAnalyzer:
             -x.get("confidence", 0),
         ))
 
-    # ── Main analysis function ───────────────────────────────────
+    # ── Main analysis - runs all 3 AIs in parallel via threads ───
     async def analyse(self, fixture_text: str, date: str) -> Dict:
-        """
-        Run all 3 AIs in parallel, parse results, merge.
-        Returns {"tips": [...], "activeAIs": [...], "debug": "..."}
-        """
         prompt = self._build_prompt(fixture_text, date)
 
-        claude_raw, gemini_raw, groq_raw = await asyncio.gather(
-            self._call_claude(prompt),
-            self._call_gemini(prompt),
-            self._call_groq(prompt),
-        )
+        # Run all 3 AIs in parallel using threads (works in async context)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                "claude": executor.submit(_call_claude_sync, prompt),
+                "gemini": executor.submit(_call_gemini_sync, prompt),
+                "groq": executor.submit(_call_groq_sync, prompt),
+            }
+            claude_raw = futures["claude"].result()
+            gemini_raw = futures["gemini"].result()
+            groq_raw = futures["groq"].result()
 
         c_tips, c_dbg = self._extract_tips(claude_raw, "Claude")
         g_tips, g_dbg = self._extract_tips(gemini_raw, "Gemini")
