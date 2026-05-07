@@ -259,6 +259,45 @@ async def health():
     }
 
 
+@app.get("/api/debug/ai")
+async def debug_ai():
+    """Test each AI directly with a simple prompt to see which ones work."""
+    test_prompt = "Reply with only the word: WORKING"
+    results = {}
+
+    # Test Claude
+    try:
+        result = await ai_analyzer._call_claude(test_prompt)
+        results["claude"] = {
+            "status": "success" if result and not result.startswith("ERR:") else "failed",
+            "response": result[:200] if result else "empty",
+        }
+    except Exception as e:
+        results["claude"] = {"status": "error", "response": str(e)[:200]}
+
+    # Test Gemini
+    try:
+        result = await ai_analyzer._call_gemini(test_prompt)
+        results["gemini"] = {
+            "status": "success" if result and not result.startswith("ERR:") else "failed",
+            "response": result[:200] if result else "empty",
+        }
+    except Exception as e:
+        results["gemini"] = {"status": "error", "response": str(e)[:200]}
+
+    # Test Groq
+    try:
+        result = await ai_analyzer._call_groq(test_prompt)
+        results["groq"] = {
+            "status": "success" if result and not result.startswith("ERR:") else "failed",
+            "response": result[:200] if result else "empty",
+        }
+    except Exception as e:
+        results["groq"] = {"status": "error", "response": str(e)[:200]}
+
+    return results
+
+
 # ── Run ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
