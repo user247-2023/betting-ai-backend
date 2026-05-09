@@ -120,25 +120,48 @@ class OddsFetcher:
             return {}
 
     def _norm(self, s: str) -> str:
-        """Normalise team name for comparison."""
-        return s.lower().replace("fc", "").replace("sc", "").replace(" ", "")
+        """Normalise team name for fuzzy comparison."""
+        return (s.lower()
+            .replace("fc", "").replace("sc", "").replace("ac", "")
+            .replace("afc", "").replace("cf", "").replace("city", "")
+            .replace("united", "utd").replace("hotspur", "")
+            .replace("&", "and").replace(".", "")
+            .replace("-", " ").strip()
+            .replace("  ", " ").replace(" ", ""))
+
+    def _teams_match(self, name1: str, name2: str) -> bool:
+        """Check if two team names refer to the same team."""
+        n1 = self._norm(name1)
+        n2 = self._norm(name2)
+        if n1 == n2:
+            return True
+        # One contains the other
+        if n1 in n2 or n2 in n1:
+            return True
+        # First 5 chars match
+        if len(n1) >= 5 and len(n2) >= 5 and n1[:5] == n2[:5]:
+            return True
+        # Check word overlap
+        words1 = set(name1.lower().split())
+        words2 = set(name2.lower().split())
+        # Remove common words
+        common_words = {"fc", "sc", "ac", "cf", "city", "united", "utd", "the", "de", "of"}
+        words1 -= common_words
+        words2 -= common_words
+        if words1 and words2:
+            overlap = words1 & words2
+            if len(overlap) >= 1 and max(len(w) for w in overlap) >= 4:
+                return True
+        return False
 
     def _find_match_odds(self, events: List[Dict], home: str, away: str) -> Dict:
-        """Find matching event and extract odds."""
-        home_norm = self._norm(home)
-        away_norm = self._norm(away)
-
+        """Find matching event using flexible name matching."""
         for event in events:
-            ev_home = self._norm(event.get("home_team", ""))
-            ev_away = self._norm(event.get("away_team", ""))
+            ev_home = event.get("home_team", "")
+            ev_away = event.get("away_team", "")
 
-            # Check if teams match
-            home_match = (
-                home_norm[:6] in ev_home or ev_home[:6] in home_norm
-            )
-            away_match = (
-                away_norm[:6] in ev_away or ev_away[:6] in away_norm
-            )
+            home_match = self._teams_match(home, ev_home)
+            away_match = self._teams_match(away, ev_away)
 
             if not (home_match and away_match):
                 continue
@@ -146,7 +169,6 @@ class OddsFetcher:
             # Extract odds from bookmakers
             odds_data = {}
             for bookmaker in event.get("bookmakers", []):
-                bk_name = bookmaker.get("key", "")
                 for market in bookmaker.get("markets", []):
                     market_key = market.get("key", "")
 
@@ -156,6 +178,7 @@ class OddsFetcher:
                             name = outcome.get("name", "")
                             price = outcome.get("price", 0)
                             key = f"{name} {point} Goals"
+                            # Keep best (lowest) odds across bookmakers
                             if key not in odds_data or price < odds_data[key]:
                                 odds_data[key] = round(price, 2)
 
@@ -168,9 +191,11 @@ class OddsFetcher:
                                 odds_data[key] = round(price, 2)
 
             if odds_data:
+                print(f"[OddsFetcher] Matched: {home} vs {away} -> {ev_home} vs {ev_away}")
+                print(f"[OddsFetcher] Markets found: {list(odds_data.keys())}")
                 return {
-                    "home": event.get("home_team"),
-                    "away": event.get("away_team"),
+                    "home": ev_home,
+                    "away": ev_away,
                     "commence_time": event.get("commence_time"),
                     "odds": odds_data,
                 }
@@ -179,22 +204,43 @@ class OddsFetcher:
 
     def get_best_odds(self, pick: str, odds_data: Dict) -> Optional[float]:
         """
-        Find the real bookmaker odds for a given pick.
-        e.g. pick = "Over 2.5 Goals" → returns 1.85
+        Find real bookmaker odds for a given pick.
+        e.g. "Over 2.5 Goals" -> looks for "Over 2.5 Goals" in odds_data
         """
-        if not odds_data:
+        if not odds_data or not odds_data.get("odds"):
             return None
 
-        pick_lower = pick.lower()
-        for market_name, price in odds_data.get("odds", {}).items():
-            if market_name.lower() in pick_lower or pick_lower in market_name.lower():
+        pick_lower = pick.lower().strip()
+        available = odds_data.get("odds", {})
+
+        # Try exact match first
+        for market_name, price in available.items():
+            if market_name.lower() == pick_lower:
                 return price
 
-        # Try partial match
-        for market_name, price in odds_data.get("odds", {}).items():
-            parts = pick_lower.split()
-            if any(p in market_name.lower() for p in parts if len(p) > 2):
+        # Try: "Over 2.5 Goals" matches "Over 2.5 Goals"
+        for market_name, price in available.items():
+            m_lower = market_name.lower()
+            if pick_lower in m_lower or m_lower in pick_lower:
                 return price
+
+        # Try extracting number: "Over 2.5" from "Over 2.5 Goals"
+        import re
+        pick_num = re.search(r'(\d+\.?\d*)', pick)
+        pick_dir = "over" if "over" in pick_lower else "under" if "under" in pick_lower else ""
+        if pick_num and pick_dir:
+            num = pick_num.group(1)
+            for market_name, price in available.items():
+                m_lower = market_name.lower()
+                if pick_dir in m_lower and num in m_lower:
+                    return price
+
+        # BTTS matching
+        if "btts" in pick_lower or "both teams" in pick_lower:
+            yes_no = "yes" if "yes" in pick_lower else "no" if "no" in pick_lower else ""
+            for market_name, price in available.items():
+                if "btts" in market_name.lower() and yes_no in market_name.lower():
+                    return price
 
         return None
 
