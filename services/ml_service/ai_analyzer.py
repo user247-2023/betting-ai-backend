@@ -27,7 +27,7 @@ def _call_claude_sync(prompt: str) -> str:
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 4000,
+                "max_tokens": 8000,
                 "messages": [{"role": "user", "content": prompt}],
             },
             timeout=45,
@@ -99,7 +99,7 @@ def _call_groq_sync(prompt: str) -> str:
                     {"role": "system", "content": "Football analyst. Return ONLY a JSON array. Start [ end ]. No markdown."},
                     {"role": "user", "content": prompt},
                 ],
-                "max_tokens": 4000,
+                "max_tokens": 8000,
                 "temperature": 0.1,
             },
             timeout=45,
@@ -141,7 +141,7 @@ class AIAnalyzer:
             "Over/Under 8.5/9.5/10.5/11.5 Corners | "
             "Over/Under 3.5/4.5/5.5 Cards | Both Halves Over 0.5 | Clean Sheet\n\n"
             "FORBIDDEN: match winner, double chance, correct score, goalscorer, handicap.\n\n"
-            "Generate EXACTLY 20 tips. Variety of markets AND leagues.\n"
+            "Generate up to 50 HIGH QUALITY tips — pick the best opportunities from the fixture list. Cover a variety of leagues AND markets. Quality over quantity — only include tips with strong supporting stats.\n"
             "reasoning: 3-4 sentences with specific stats.\n"
             "key_stats: 4-5 data points.\n"
             "confidence: 65-92. risk: LOW(80+), MEDIUM(65-79), HIGH(<65).\n\n"
