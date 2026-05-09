@@ -181,9 +181,9 @@ class DataService:
 
     # ── FORMAT FOR AI PROMPT ─────────────────────────────────────
     def format_for_prompt(self, fixtures: List[Dict]) -> str:
-        """Format fixtures into text for AI analysis prompt."""
+        """Format ALL fixtures into text for AI analysis prompt."""
         lines = []
-        for i, f in enumerate(fixtures[:30], 1):
+        for i, f in enumerate(fixtures, 1):
             lines.append(f"{i}. {f['home']} vs {f['away']} | "
                          f"{f['league']} ({f['country']}) | {f['time']}")
         return "\n".join(lines)
