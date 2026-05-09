@@ -16,7 +16,6 @@ from datetime import datetime
 
 # Service imports
 from services.data_service.fetcher import DataService
-from services.data_service.odds_fetcher import OddsFetcher
 from services.ml_service.probability_engine import ProbabilityEngine
 from services.ml_service.streak_engine import StreakEngine
 from services.ml_service.ai_analyzer import AIAnalyzer
@@ -25,6 +24,17 @@ from services.decision_engine.rollover_filter import RolloverFilter
 from services.decision_engine.rollover_manager import RolloverManager
 from services.decision_engine.risk_manager import RiskManager
 from services.decision_engine.strategy_engine import StrategyEngine
+
+# Optional odds integration
+try:
+    from services.data_service.odds_fetcher import OddsFetcher
+    odds_fetcher = OddsFetcher()
+    ODDS_ENABLED = True
+    print("[Main] OddsFetcher loaded successfully")
+except ImportError:
+    odds_fetcher = None
+    ODDS_ENABLED = False
+    print("[Main] OddsFetcher not found - running without real odds")
 
 # ── App Setup ────────────────────────────────────────────────────
 app = FastAPI(
@@ -68,7 +78,6 @@ async def verify_api_key(request: Request):
 
 # ── Initialise Services ─────────────────────────────────────────
 data_svc = DataService()
-odds_fetcher = OddsFetcher()
 prob_engine = ProbabilityEngine()
 streak_engine = StreakEngine(min_threshold=0.05)
 ai_analyzer = AIAnalyzer()
@@ -130,9 +139,8 @@ async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
     # ── STEP 3: ML Service - calibrate probabilities ─────────────
     tips = prob_engine.calibrate_batch(tips)
 
-    # ── STEP 3.5: Data Service - enrich with REAL bookmaker odds ─
-    has_odds_key = bool(os.getenv("ODDS_API_KEY", ""))
-    if has_odds_key:
+    # ── STEP 3.5: Enrich with real odds if available ─────────────
+    if ODDS_ENABLED and odds_fetcher and os.getenv("ODDS_API_KEY"):
         tips = odds_fetcher.enrich_tips_with_odds(tips)
         real_odds_count = sum(1 for t in tips if t.get("real_odds_available"))
         print(f"[OddsFetcher] Enriched {real_odds_count}/{len(tips)} tips with real odds")
@@ -269,8 +277,59 @@ async def health():
     }
 
 
-@app.get("/api/debug/ai")
-async def debug_ai():
+@app.get("/api/debug/odds")
+async def debug_odds():
+    """Test The Odds API directly."""
+    key = os.getenv("ODDS_API_KEY", "")
+    if not key:
+        return {"error": "ODDS_API_KEY not set in Railway variables"}
+
+    try:
+        import requests as req
+        # Test 1: Check available sports
+        r = req.get(
+            "https://api.the-odds-api.com/v4/sports",
+            params={"apiKey": key},
+            timeout=8,
+        )
+        remaining = r.headers.get("x-requests-remaining", "?")
+        used = r.headers.get("x-requests-used", "?")
+
+        if r.status_code != 200:
+            return {
+                "error": f"HTTP {r.status_code}",
+                "body": r.text[:300],
+                "key_loaded": True,
+                "key_starts_with": key[:12] + "...",
+            }
+
+        sports = r.json()
+        soccer_sports = [s for s in sports if "soccer" in s.get("key", "")]
+
+        # Test 2: Get EPL odds
+        r2 = req.get(
+            "https://api.the-odds-api.com/v4/sports/soccer_epl/odds",
+            params={
+                "apiKey": key,
+                "regions": "uk,eu",
+                "markets": "totals",
+                "oddsFormat": "decimal",
+            },
+            timeout=8,
+        )
+
+        return {
+            "key_loaded": True,
+            "key_starts_with": key[:12] + "...",
+            "requests_remaining": remaining,
+            "requests_used": used,
+            "soccer_leagues_available": len(soccer_sports),
+            "epl_odds_status": r2.status_code,
+            "epl_matches_found": len(r2.json()) if r2.status_code == 200 else 0,
+            "sample_match": r2.json()[0].get("home_team") + " vs " + r2.json()[0].get("away_team") if r2.status_code == 200 and r2.json() else "none",
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
     """Test each AI directly with a simple prompt to see exactly what fails."""
     test_prompt = "Reply with only the word: WORKING"
     results = {
