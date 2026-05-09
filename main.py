@@ -1,20 +1,22 @@
 """
-ROLLOVER BETTING AI - MAIN API
-3-Service Architecture on Railway:
-  1. Data Service     -> fetches fixtures from API-Football
-  2. ML Service       -> probability calibration + AI analysis
-  3. Decision Engine  -> value detection + rollover filter + risk management
+ROLLOVER BETTING AI - MAIN API v4.0
+Upgraded with:
+  - ML prediction pipeline (XGBoost + LightGBM + RandomForest)
+  - APScheduler background jobs
+  - In-memory caching (Redis-ready)
+  - Auto result settlement
+  - PostgreSQL-compatible tracking
 """
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from datetime import datetime
 
-# Service imports
+# Core services
 from services.data_service.fetcher import DataService
 from services.ml_service.probability_engine import ProbabilityEngine
 from services.ml_service.streak_engine import StreakEngine
@@ -24,6 +26,17 @@ from services.decision_engine.rollover_filter import RolloverFilter
 from services.decision_engine.rollover_manager import RolloverManager
 from services.decision_engine.risk_manager import RiskManager
 from services.decision_engine.strategy_engine import StrategyEngine
+
+# ML pipeline
+try:
+    from services.ml_predictor import get_predictor
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    print("[Main] ML predictor not available")
+
+# Cache
+from utils.cache import get_cache, TTL_FIXTURES, TTL_AI_TIPS
 
 # Optional odds integration
 try:
@@ -35,6 +48,69 @@ except ImportError:
     odds_fetcher = None
     ODDS_ENABLED = False
     print("[Main] OddsFetcher not found - running without real odds")
+
+# Result settlement
+try:
+    from services.result_settlement import ResultSettlement
+    settler = ResultSettlement()
+    SETTLEMENT_ENABLED = True
+except ImportError:
+    settler = None
+    SETTLEMENT_ENABLED = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events."""
+    print("[Main] Starting up...")
+
+    # Start background scheduler
+    try:
+        from utils.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        scheduler.start()
+        print("[Main] Scheduler started")
+    except Exception as e:
+        print(f"[Main] Scheduler failed to start: {e}")
+
+    yield
+
+    # Shutdown
+    try:
+        scheduler.stop()
+    except Exception:
+        pass
+    print("[Main] Shutdown complete")
+
+
+app = FastAPI(
+    title="Rollover Betting AI",
+    description="ML-powered 3-service betting intelligence system",
+    version="4.0.0",
+    lifespan=lifespan,
+    docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
+    redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+)
+
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+
+async def verify_api_key(request: Request):
+    if request.url.path in ("/api/health", "/api/debug/ai", "/api/debug/odds"):
+        return True
+    if not INTERNAL_API_KEY:
+        return True
+    key = request.headers.get("X-API-Key", "")
+    if key != INTERNAL_API_KEY:
+        print(f"Auth failed. Received key: '{key[:10]}...' Expected: '{INTERNAL_API_KEY[:10]}...'")
+        raise HTTPException(status_code=401, detail="Unauthorized - invalid API key")
+    return True
 
 # ── App Setup ────────────────────────────────────────────────────
 app = FastAPI(
@@ -139,7 +215,17 @@ async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
     # ── STEP 3: ML Service - calibrate probabilities ─────────────
     tips = prob_engine.calibrate_batch(tips)
 
-    # ── STEP 3.5: Enrich with real odds if available ─────────────
+    # ── STEP 3.5: ML Predictor - blend ML + AI probabilities ─────
+    if ML_AVAILABLE:
+        try:
+            predictor = get_predictor()
+            if predictor.is_ready():
+                tips = predictor.enrich_tips(tips)
+                print(f"[Main] ML enriched {len(tips)} tips")
+        except Exception as e:
+            print(f"[Main] ML enrichment error: {e}")
+
+    # ── STEP 3.6: Enrich with real odds if available ──────────────
     if ODDS_ENABLED and odds_fetcher and os.getenv("ODDS_API_KEY"):
         tips = odds_fetcher.enrich_tips_with_odds(tips)
         real_odds_count = sum(1 for t in tips if t.get("real_odds_available"))
@@ -260,21 +346,91 @@ async def rollover_state():
 @app.get("/api/health")
 async def health():
     """Health check."""
+    cache = get_cache()
+    ml_ready = False
+    ml_markets = []
+    if ML_AVAILABLE:
+        try:
+            pred = get_predictor()
+            ml_ready = pred.is_ready()
+            ml_markets = pred.loaded_markets()
+        except Exception:
+            pass
+
     return {
         "status": "ok",
-        "version": "3.0.0",
+        "version": "4.0.0",
         "services": {
-            "data": "API-Football",
-            "ml": "Claude + Gemini + Groq",
-            "decision": "Value + Rollover + Risk",
+            "data":       "API-Football",
+            "ml":         "Claude + Gemini + Groq + XGBoost/LightGBM",
+            "decision":   "Value + Rollover + Risk",
+            "cache":      cache.stats(),
+            "ml_models":  {"ready": ml_ready, "markets": len(ml_markets)},
+            "settlement": SETTLEMENT_ENABLED,
         },
         "keys_loaded": {
-            "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
-            "gemini": bool(os.getenv("GEMINI_API_KEY")),
-            "groq": bool(os.getenv("GROQ_API_KEY")),
-            "api_football": bool(os.getenv("API_FOOTBALL_KEY")),
+            "anthropic":   bool(os.getenv("ANTHROPIC_API_KEY")),
+            "gemini":      bool(os.getenv("GEMINI_API_KEY")),
+            "groq":        bool(os.getenv("GROQ_API_KEY")),
+            "api_football":bool(os.getenv("API_FOOTBALL_KEY")),
         }
     }
+
+
+@app.get("/api/ml/status")
+async def ml_status():
+    """ML model status and metrics."""
+    if not ML_AVAILABLE:
+        return {"available": False, "message": "ML pipeline not installed"}
+    pred = get_predictor()
+    return {
+        "available": True,
+        "ready":     pred.is_ready(),
+        "markets":   pred.loaded_markets(),
+        "metrics":   pred.model_metrics(),
+    }
+
+
+@app.post("/api/ml/train")
+async def trigger_training(auth: bool = Depends(verify_api_key)):
+    """Manually trigger model retraining (runs in background)."""
+    import asyncio
+    from utils.scheduler import get_scheduler
+    scheduler = get_scheduler()
+    asyncio.create_task(scheduler._retrain_models())
+    return {"status": "Training started in background"}
+
+
+@app.post("/api/settle")
+async def settle_predictions(date: Optional[str] = None,
+                              auth: bool = Depends(verify_api_key)):
+    """Manually trigger result settlement for a date."""
+    if not SETTLEMENT_ENABLED:
+        return {"error": "Settlement not available"}
+    result = settler.settle_predictions(date)
+    return result
+
+
+@app.get("/api/settle/stats")
+async def settlement_stats():
+    """Get overall prediction performance stats."""
+    if not SETTLEMENT_ENABLED:
+        return {"error": "Settlement not available"}
+    return settler.get_performance_stats()
+
+
+@app.get("/api/cache/stats")
+async def cache_stats():
+    """Cache performance stats."""
+    return get_cache().stats()
+
+
+@app.delete("/api/cache/clear")
+async def clear_cache(auth: bool = Depends(verify_api_key)):
+    """Clear all cached data."""
+    cache = get_cache()
+    cache.clear_pattern("")
+    return {"status": "Cache cleared"}
 
 
 @app.get("/api/debug/odds")
