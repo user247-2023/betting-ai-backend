@@ -16,6 +16,7 @@ from datetime import datetime
 
 # Service imports
 from services.data_service.fetcher import DataService
+from services.data_service.odds_fetcher import OddsFetcher
 from services.ml_service.probability_engine import ProbabilityEngine
 from services.ml_service.streak_engine import StreakEngine
 from services.ml_service.ai_analyzer import AIAnalyzer
@@ -67,6 +68,7 @@ async def verify_api_key(request: Request):
 
 # ── Initialise Services ─────────────────────────────────────────
 data_svc = DataService()
+odds_fetcher = OddsFetcher()
 prob_engine = ProbabilityEngine()
 streak_engine = StreakEngine(min_threshold=0.05)
 ai_analyzer = AIAnalyzer()
@@ -128,6 +130,13 @@ async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
     # ── STEP 3: ML Service - calibrate probabilities ─────────────
     tips = prob_engine.calibrate_batch(tips)
 
+    # ── STEP 3.5: Data Service - enrich with REAL bookmaker odds ─
+    has_odds_key = bool(os.getenv("ODDS_API_KEY", ""))
+    if has_odds_key:
+        tips = odds_fetcher.enrich_tips_with_odds(tips)
+        real_odds_count = sum(1 for t in tips if t.get("real_odds_available"))
+        print(f"[OddsFetcher] Enriched {real_odds_count}/{len(tips)} tips with real odds")
+
     # ── STEP 4: Decision Engine - value calculation ──────────────
     tips = value_engine.evaluate_batch(tips)
 
@@ -164,6 +173,7 @@ async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
         "date": today,
         "fixturesFound": len(fixtures),
         "activeAIs": active_ais,
+        "realOddsEnabled": bool(os.getenv("ODDS_API_KEY", "")),
         "risk_status": risk_status,
         "generatedAt": int(datetime.utcnow().timestamp() * 1000),
     }
