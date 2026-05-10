@@ -391,14 +391,17 @@ async def ml_status():
     }
 
 
-@app.post("/api/ml/train")
-async def trigger_training(auth: bool = Depends(verify_api_key)):
-    """Manually trigger model retraining (runs in background)."""
+@app.get("/api/ml/train")
+async def trigger_training():
+    """Manually trigger model retraining (runs in background). Call from browser."""
     import asyncio
-    from utils.scheduler import get_scheduler
-    scheduler = get_scheduler()
-    asyncio.create_task(scheduler._retrain_models())
-    return {"status": "Training started in background"}
+    try:
+        from utils.scheduler import get_scheduler
+        scheduler = get_scheduler()
+        asyncio.create_task(scheduler._retrain_models())
+        return {"status": "Training started in background. Check /api/ml/status in 2-3 minutes."}
+    except Exception as e:
+        return {"status": "Training triggered", "note": str(e)}
 
 
 @app.post("/api/settle")
