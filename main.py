@@ -1,5 +1,5 @@
 """
-ROLLOVER BETTING AI - MAIN API v4.1
+ROLLOVER BETTING AI - MAIN API v4.1.1
 Upgraded with:
   - Rate limiting (slowapi) — abuse protection
   - Structured JSON logging — full request/error tracking
@@ -18,10 +18,26 @@ from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict
 from datetime import datetime
 
-# Rate limiting
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
+# Rate limiting — fault-tolerant import
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    RATE_LIMITING = True
+except ImportError:
+    print("[Main] WARNING: slowapi not installed — rate limiting disabled")
+    RATE_LIMITING = False
+    # Stub classes so app still starts
+    class Limiter:
+        def __init__(self, **kwargs): pass
+        def limit(self, *args, **kwargs):
+            def decorator(f): return f
+            return decorator
+    def get_remote_address(request): return "0.0.0.0"
+    class RateLimitExceeded(Exception): pass
+    def _rate_limit_exceeded_handler(request, exc):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"error": "rate limited"}, status_code=429)
 
 # Core services
 from services.data_service.fetcher import DataService
@@ -107,7 +123,7 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="Rollover Betting AI",
     description="ML-powered quantitative football prediction system v4.1",
-    version="4.1.0",
+    version="4.1.1",
     lifespan=lifespan,
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
@@ -479,6 +495,9 @@ async def backtest_summary():
         return {"cached": True, "summary": data.get("summary", {}),
                 "generated_at": data.get("generated_at")}
     return {"cached": False, "message": "No backtest results yet. Call /api/backtest first."}
+
+
+@app.get("/api/health")
 async def health():
     """Health check."""
     cache = get_cache()
