@@ -30,7 +30,7 @@ def _call_claude_sync(prompt: str) -> str:
                 "max_tokens": 8000,
                 "messages": [{"role": "user", "content": prompt}],
             },
-            timeout=45,
+            timeout=90,
         )
         print(f"[Claude] HTTP {r.status_code}")
         if r.status_code != 200:
@@ -60,7 +60,7 @@ def _call_gemini_sync(prompt: str) -> str:
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"maxOutputTokens": 4000, "temperature": 0.1},
             },
-            timeout=45,
+            timeout=90,
         )
         print(f"[Gemini] HTTP {r.status_code}")
         if r.status_code != 200:
@@ -102,7 +102,7 @@ def _call_groq_sync(prompt: str) -> str:
                 "max_tokens": 8000,
                 "temperature": 0.1,
             },
-            timeout=45,
+            timeout=90,
         )
         print(f"[Groq] HTTP {r.status_code}")
         if r.status_code != 200:
