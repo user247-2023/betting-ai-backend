@@ -12,3 +12,4 @@ numpy==1.26.4
 apscheduler==3.10.4
 aiosqlite==0.20.0
 redis==5.0.8
+slowapi==0.1.9
