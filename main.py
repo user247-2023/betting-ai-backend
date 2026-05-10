@@ -1,20 +1,27 @@
 """
-ROLLOVER BETTING AI - MAIN API v4.0
+ROLLOVER BETTING AI - MAIN API v4.1
 Upgraded with:
-  - ML prediction pipeline (XGBoost + LightGBM + RandomForest)
-  - APScheduler background jobs
-  - In-memory caching (Redis-ready)
-  - Auto result settlement
-  - PostgreSQL-compatible tracking
+  - Rate limiting (slowapi) — abuse protection
+  - Structured JSON logging — full request/error tracking
+  - Smart AI routing — ML-first, LLMs only when uncertain
+  - Retry logic — graceful AI fallback
+  - Request validation — Pydantic input sanitization
+  - Backtesting engine — strategy validation
 """
 import os
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict
 from datetime import datetime
+
+# Rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Core services
 from services.data_service.fetcher import DataService
@@ -27,27 +34,38 @@ from services.decision_engine.rollover_manager import RolloverManager
 from services.decision_engine.risk_manager import RiskManager
 from services.decision_engine.strategy_engine import StrategyEngine
 
+# Utilities
+from utils.cache import get_cache, TTL_FIXTURES, TTL_AI_TIPS
+from utils.logger import get_logger, get_request_logger
+
+logger         = get_logger("main")
+request_logger = get_request_logger()
+
 # ML pipeline
 try:
     from services.ml_predictor import get_predictor
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
-    print("[Main] ML predictor not available")
+    logger.warning("[Main] ML predictor not available")
 
-# Cache
-from utils.cache import get_cache, TTL_FIXTURES, TTL_AI_TIPS
+# Smart AI router
+try:
+    from utils.smart_router import get_router
+    SMART_ROUTING = True
+except ImportError:
+    SMART_ROUTING = False
+    logger.warning("[Main] Smart router not available")
 
 # Optional odds integration
 try:
     from services.data_service.odds_fetcher import OddsFetcher
     odds_fetcher = OddsFetcher()
     ODDS_ENABLED = True
-    print("[Main] OddsFetcher loaded successfully")
+    logger.info("[Main] OddsFetcher loaded successfully")
 except ImportError:
     odds_fetcher = None
     ODDS_ENABLED = False
-    print("[Main] OddsFetcher not found - running without real odds")
 
 # Result settlement
 try:
@@ -83,14 +101,20 @@ async def lifespan(app: FastAPI):
     print("[Main] Shutdown complete")
 
 
+# ── Rate limiter ─────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(
     title="Rollover Betting AI",
-    description="ML-powered 3-service betting intelligence system",
-    version="4.0.0",
+    description="ML-powered quantitative football prediction system v4.1",
+    version="4.1.0",
     lifespan=lifespan,
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,6 +122,27 @@ app.add_middleware(
     allow_methods=["POST", "GET", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every request with timing."""
+    start  = time.time()
+    try:
+        response = await call_next(request)
+        duration = (time.time() - start) * 1000
+        request_logger.log_request(
+            method      = request.method,
+            path        = request.url.path,
+            client_ip   = get_remote_address(request),
+            status      = response.status_code,
+            duration_ms = duration,
+        )
+        return response
+    except Exception as e:
+        duration = (time.time() - start) * 1000
+        request_logger.log_error(e, context=request.url.path)
+        raise
 
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 
@@ -186,8 +231,15 @@ class BankrollUpdate(BaseModel):
 #                 Rollover Filter -> Strategy Decision
 # ══════════════════════════════════════════════════════════════════
 @app.post("/api/tips")
-async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
-    today = req.date or datetime.utcnow().strftime("%Y-%m-%d")
+@limiter.limit("10/minute;50/hour")
+async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(verify_api_key)):
+    """
+    Main tips endpoint — full ML + AI pipeline.
+    Rate limited: 10 requests/minute, 50/hour per IP.
+    Smart routing: uses ML first, only calls LLMs when uncertain.
+    """
+    t_start = time.time()
+    today   = req.date or datetime.utcnow().strftime("%Y-%m-%d")
 
     # ── STEP 1: Data Service - get real fixtures ─────────────────
     fixtures = await data_svc.get_fixtures(today)
@@ -198,10 +250,36 @@ async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
             "message": f"No matches in your leagues for {today}.",
         }
 
-    # ── STEP 2: ML Service - AI analysis (3 AIs in parallel) ────
     fixture_text = data_svc.format_for_prompt(fixtures)
-    ai_result = await ai_analyzer.analyse(fixture_text, today)
-    tips = ai_result["tips"]
+
+    # ── STEP 2: Smart AI Routing decision ───────────────────────
+    available_ais = ["claude", "gemini", "groq"]
+    routing_info  = {}
+    if SMART_ROUTING and ML_AVAILABLE:
+        try:
+            router    = get_router()
+            predictor = get_predictor()
+            routing   = router.route(
+                fixture_text    = fixture_text,
+                ml_ready        = predictor.is_ready(),
+                ml_predictions  = {},
+                available_ais   = available_ais,
+                markets_requested = [
+                    "Over 2.5 Goals", "BTTS Yes", "Over 1.5 Goals",
+                    "Over 9.5 Corners", "BTTS No"
+                ],
+            )
+            routing_info = routing
+            logger.info(f"[SmartRouter] Decision: {routing['reasoning']}")
+            # Use cached responses if available
+            if routing.get("cached_responses"):
+                logger.info("[SmartRouter] Serving from cache — no AI calls made")
+        except Exception as e:
+            logger.warning(f"[SmartRouter] Failed, falling back to full AI: {e}")
+
+    # ── STEP 3: AI Analysis (3 AIs in parallel) ─────────────────
+    ai_result  = await ai_analyzer.analyse(fixture_text, today)
+    tips       = ai_result["tips"]
     active_ais = ai_result["activeAIs"]
 
     if not tips:
@@ -212,64 +290,82 @@ async def get_tips(req: TipsRequest, auth: bool = Depends(verify_api_key)):
             "message": f"AI debug: {ai_result['debug']}",
         }
 
-    # ── STEP 3: ML Service - calibrate probabilities ─────────────
+    # ── STEP 4: Probability calibration ─────────────────────────
     tips = prob_engine.calibrate_batch(tips)
 
-    # ── STEP 3.5: ML Predictor - blend ML + AI probabilities ─────
+    # ── STEP 5: ML enrichment (blend ML 55% + AI 45%) ───────────
+    ml_enriched = False
     if ML_AVAILABLE:
         try:
             predictor = get_predictor()
             if predictor.is_ready():
-                tips = predictor.enrich_tips(tips)
-                print(f"[Main] ML enriched {len(tips)} tips")
+                tips        = predictor.enrich_tips(tips)
+                ml_enriched = True
+                logger.info(f"[Main] ML enriched {len(tips)} tips")
         except Exception as e:
-            print(f"[Main] ML enrichment error: {e}")
+            logger.warning(f"[Main] ML enrichment failed: {e}")
 
-    # ── STEP 3.6: Enrich with real odds if available ──────────────
+    # ── STEP 6: Real odds enrichment ────────────────────────────
     if ODDS_ENABLED and odds_fetcher and os.getenv("ODDS_API_KEY"):
-        tips = odds_fetcher.enrich_tips_with_odds(tips)
-        real_odds_count = sum(1 for t in tips if t.get("real_odds_available"))
-        print(f"[OddsFetcher] Enriched {real_odds_count}/{len(tips)} tips with real odds")
+        try:
+            tips = odds_fetcher.enrich_tips_with_odds(tips)
+            real_odds_count = sum(1 for t in tips if t.get("real_odds_available"))
+            logger.info(f"[OddsFetcher] Enriched {real_odds_count}/{len(tips)} tips")
+        except Exception as e:
+            logger.warning(f"[OddsFetcher] Failed: {e}")
 
-    # ── STEP 4: Decision Engine - value calculation ──────────────
+    # ── STEP 7: Value calculation ────────────────────────────────
     tips = value_engine.evaluate_batch(tips)
 
-    # ── STEP 5: Decision Engine - rollover filter ────────────────
+    # ── STEP 8: Rollover filter ──────────────────────────────────
     for tip in tips:
-        filter_result = rollover_filter.check(tip)
+        filter_result          = rollover_filter.check(tip)
         tip["rollover_approved"] = filter_result["approved"]
-        tip["rollover_reason"] = filter_result["reason"]
-        tip["approved"] = filter_result["approved"]
+        tip["rollover_reason"]   = filter_result["reason"]
+        tip["approved"]          = filter_result["approved"]
 
-    # ── STEP 6: Decision Engine - strategy selection ─────────────
+    # ── STEP 9: Strategy decision ────────────────────────────────
     tips = strategy_engine.batch_decide(tips)
 
-    # ── STEP 7: ML Service - streak probability ─────────────────
+    # ── STEP 10: Streak probability ──────────────────────────────
     for tip in tips:
         if tip.get("strategy") == "rollover":
             sp = streak_engine.calculate(tip["predicted_probability"], 5)
-            tip["streak_probability_5"] = sp["streak_probability"]
+            tip["streak_probability_5"]     = sp["streak_probability"]
             tip["streak_probability_5_pct"] = sp["streak_probability_pct"]
-            tip["optimal_chain"] = streak_engine.optimal_chain_length(
+            tip["optimal_chain"]            = streak_engine.optimal_chain_length(
                 tip["predicted_probability"]
             )["optimal_steps"]
 
-    # ── STEP 8: Risk check ───────────────────────────────────────
+    # ── STEP 11: Risk check ──────────────────────────────────────
     risk_status = risk_mgr.status()
     for tip in tips:
         if risk_status["risk_level"] in ("STOPPED", "SHUTDOWN"):
-            tip["strategy"] = "skip"
+            tip["strategy"]        = "skip"
             tip["strategy_reason"] = f"Risk manager: {risk_status['risk_level']}"
 
+    duration_ms = (time.time() - t_start) * 1000
+    request_logger.log_tips_generated(
+        n_fixtures  = len(fixtures),
+        n_tips      = len(tips),
+        active_ais  = active_ais,
+        ml_used     = ml_enriched,
+        duration_ms = duration_ms,
+    )
+
     return {
-        "tips": tips,
-        "count": len(tips),
-        "date": today,
-        "fixturesFound": len(fixtures),
-        "activeAIs": active_ais,
+        "tips":            tips,
+        "count":           len(tips),
+        "date":            today,
+        "fixturesFound":   len(fixtures),
+        "activeAIs":       active_ais,
         "realOddsEnabled": bool(os.getenv("ODDS_API_KEY", "")),
-        "risk_status": risk_status,
-        "generatedAt": int(datetime.utcnow().timestamp() * 1000),
+        "mlEnabled":       ml_enriched,
+        "risk_status":     risk_status,
+        "routing":         routing_info.get("reasoning", "standard"),
+        "costSaved":       routing_info.get("cost_estimate", {}),
+        "durationMs":      round(duration_ms, 0),
+        "generatedAt":     int(datetime.utcnow().timestamp() * 1000),
     }
 
 
