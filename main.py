@@ -343,7 +343,46 @@ async def rollover_state():
     return rollover_mgr.state()
 
 
-@app.get("/api/health")
+@app.get("/api/backtest")
+async def run_backtest(
+    use_synthetic: bool = True,
+    start_bankroll: float = 1000.0,
+    n_monte_carlo: int = 1000,
+    auth: bool = Depends(verify_api_key)
+):
+    """
+    Run full backtesting suite.
+    use_synthetic=true uses generated data (fast, always works).
+    use_synthetic=false uses real settled predictions from DB.
+    """
+    try:
+        from services.backtester import Backtester
+        bt = Backtester()
+        results = bt.run_full_backtest(
+            start_bankroll=start_bankroll,
+            n_monte_carlo=n_monte_carlo,
+            use_synthetic=use_synthetic,
+        )
+        # Remove large bankroll curves from response
+        for strat in results.get("strategies", {}).values():
+            strat.pop("bankroll_curve", None)
+        return results
+    except Exception as e:
+        print(f"[Backtest] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/backtest/summary")
+async def backtest_summary():
+    """Quick backtest summary — loads saved results if available."""
+    import os, json
+    path = "logs/backtest_results.json"
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        return {"cached": True, "summary": data.get("summary", {}),
+                "generated_at": data.get("generated_at")}
+    return {"cached": False, "message": "No backtest results yet. Call /api/backtest first."}
 async def health():
     """Health check."""
     cache = get_cache()
