@@ -50,12 +50,37 @@ from services.decision_engine.rollover_manager import RolloverManager
 from services.decision_engine.risk_manager import RiskManager
 from services.decision_engine.strategy_engine import StrategyEngine
 
-# Utilities
-from utils.cache import get_cache, TTL_FIXTURES, TTL_AI_TIPS
-from utils.logger import get_logger, get_request_logger
+# Utilities — fault-tolerant so a missing file can never crash startup
+try:
+    from utils.cache import get_cache, TTL_FIXTURES, TTL_AI_TIPS
+except Exception as _e:
+    print(f"[Main] WARNING: utils.cache unavailable ({_e}) — using in-memory stub")
+    TTL_FIXTURES, TTL_AI_TIPS = 1800, 1800
+    class _StubCache:
+        _d = {}
+        def get(self, k, *a, **kw): return self._d.get(k)
+        def set(self, k, v, *a, **kw): self._d[k] = v
+        def delete(self, k, *a, **kw): self._d.pop(k, None)
+        def clear(self, *a, **kw): self._d.clear()
+        def stats(self): return {"backend": "stub", "keys": len(self._d), "total": len(self._d)}
+    _stub_cache = _StubCache()
+    def get_cache(): return _stub_cache
 
-logger         = get_logger("main")
-request_logger = get_request_logger()
+try:
+    from utils.logger import get_logger, get_request_logger
+    logger         = get_logger("main")
+    request_logger = get_request_logger()
+except Exception as _e:
+    print(f"[Main] WARNING: utils.logger unavailable ({_e}) — using print fallback")
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO)
+    logger = _logging.getLogger("main")
+    class _StubReqLogger:
+        def log_request(self, *a, **kw): pass
+        def log_ai_call(self, *a, **kw): pass
+        def log_tips_generated(self, *a, **kw): pass
+        def log_error(self, *a, **kw): pass
+    request_logger = _StubReqLogger()
 
 # ML pipeline
 try:
@@ -122,8 +147,8 @@ limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="Rollover Betting AI",
-    description="ML-powered quantitative football prediction system v4.1",
-    version="4.1.1",
+    description="ML-powered quantitative football prediction system v4.1.2",
+    version="4.1.2",
     lifespan=lifespan,
     docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
     redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
@@ -168,47 +193,9 @@ async def verify_api_key(request: Request):
     if not INTERNAL_API_KEY:
         return True
     key = request.headers.get("X-API-Key", "")
-    if key != INTERNAL_API_KEY:
-        print(f"Auth failed. Received key: '{key[:10]}...' Expected: '{INTERNAL_API_KEY[:10]}...'")
-        raise HTTPException(status_code=401, detail="Unauthorized - invalid API key")
-    return True
-
-# ── App Setup ────────────────────────────────────────────────────
-app = FastAPI(
-    title="Rollover Betting AI",
-    description="3-service betting intelligence system",
-    version="3.0.0",
-    # Disable public docs in production for security
-    docs_url=None if os.getenv("ENVIRONMENT") == "production" else "/docs",
-    redoc_url=None if os.getenv("ENVIRONMENT") == "production" else "/redoc",
-)
-
-# ── CORS — allow all Vercel deployments + local dev ─────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins — Railway auth key provides security
-    allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
-)
-
-# ── API Key Authentication ───────────────────────────────────────
-INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
-
-async def verify_api_key(request: Request):
-    """Check that requests come with the correct internal API key."""
-    # Always allow health check
-    if request.url.path == "/api/health":
-        return True
-    # If no INTERNAL_API_KEY configured, allow all (open mode)
-    if not INTERNAL_API_KEY:
-        return True
-    # Check header
-    key = request.headers.get("X-API-Key", "")
-    # Also accept from query param as fallback
     if not key:
         key = request.query_params.get("key", "")
     if key != INTERNAL_API_KEY:
-        # Log for debugging
         print(f"Auth failed. Received key: '{key[:10]}...' Expected: '{INTERNAL_API_KEY[:10]}...'")
         raise HTTPException(status_code=401, detail="Unauthorized - invalid API key")
     return True
@@ -513,7 +500,7 @@ async def health():
 
     return {
         "status": "ok",
-        "version": "4.0.0",
+        "version": app.version,
         "services": {
             "data":       "API-Football",
             "ml":         "Claude + Gemini + Groq + XGBoost/LightGBM",
@@ -521,6 +508,12 @@ async def health():
             "cache":      cache.stats(),
             "ml_models":  {"ready": ml_ready, "markets": len(ml_markets)},
             "settlement": SETTLEMENT_ENABLED,
+        },
+        "features": {
+            "rate_limiting":  RATE_LIMITING,
+            "smart_routing":  SMART_ROUTING,
+            "backtesting":    True,
+            "structured_logs": True,
         },
         "keys_loaded": {
             "anthropic":   bool(os.getenv("ANTHROPIC_API_KEY")),
