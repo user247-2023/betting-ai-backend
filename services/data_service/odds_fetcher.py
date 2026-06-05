@@ -1,50 +1,56 @@
 """
-odds_fetcher.py - Fetches real bookmaker odds from The Odds API
+odds_fetcher.py — Fetches real bookmaker odds from The Odds API
 Free tier: 500 requests/month
-Covers: EPL, La Liga, Serie A, Bundesliga, Ligue 1, UCL, MLS, etc.
+
+FIXES (v2):
+  1. markets="totals" only on the bulk endpoint (btts caused HTTP 422 —
+     it is an "additional market" available only on the per-event endpoint).
+  2. League-level caching — one API call per league per cycle covers ALL
+     matches in that league, instead of one call per match (≈10-15x quota saving).
+  3. Detailed error logging — captures the response body on non-200 so any
+     future issue is diagnosable from the logs.
+  4. Optional per-event BTTS enrichment (off by default to protect quota;
+     enable with ODDS_FETCH_BTTS=true).
 """
-import requests
 import os
+import time
+import requests
 from typing import Dict, List, Optional
 
 
 # Map our league names to The Odds API sport keys
 LEAGUE_MAP = {
-    "Premier League":       "soccer_epl",
-    "Championship":         "soccer_england_championship",
-    "League One":           "soccer_england_league1",
-    "League Two":           "soccer_england_league2",
-    "La Liga":              "soccer_spain_la_liga",
-    "La Liga 2":            "soccer_spain_segunda_division",
-    "Serie A":              "soccer_italy_serie_a",
-    "Serie B":              "soccer_italy_serie_b",
-    "Bundesliga":           "soccer_germany_bundesliga",
-    "2. Bundesliga":        "soccer_germany_bundesliga2",
-    "Ligue 1":              "soccer_france_ligue_one",
-    "Ligue 2":              "soccer_france_ligue_two",
-    "Eredivisie":           "soccer_netherlands_eredivisie",
-    "Primeira Liga":        "soccer_portugal_primeira_liga",
-    "Scottish Premiership": "soccer_scotland_premiership",
-    "Belgian Pro League":   "soccer_belgium_first_div",
-    "Super Lig":            "soccer_turkey_super_league",
-    "UEFA Champions League":"soccer_uefa_champs_league",
-    "UEFA Europa League":   "soccer_uefa_europa_league",
+    "Premier League":        "soccer_epl",
+    "Championship":          "soccer_england_championship",
+    "League One":            "soccer_england_league1",
+    "League Two":            "soccer_england_league2",
+    "La Liga":               "soccer_spain_la_liga",
+    "La Liga 2":             "soccer_spain_segunda_division",
+    "Serie A":               "soccer_italy_serie_a",
+    "Serie B":               "soccer_italy_serie_b",
+    "Bundesliga":            "soccer_germany_bundesliga",
+    "2. Bundesliga":         "soccer_germany_bundesliga2",
+    "Ligue 1":               "soccer_france_ligue_one",
+    "Ligue 2":               "soccer_france_ligue_two",
+    "Eredivisie":            "soccer_netherlands_eredivisie",
+    "Primeira Liga":         "soccer_portugal_primeira_liga",
+    "Scottish Premiership":  "soccer_scotland_premiership",
+    "Belgian Pro League":    "soccer_belgium_first_div",
+    "Super Lig":             "soccer_turkey_super_league",
+    "UEFA Champions League": "soccer_uefa_champs_league",
+    "UEFA Europa League":    "soccer_uefa_europa_league",
     "UEFA Conference League":"soccer_uefa_europa_conference_league",
-    "MLS":                  "soccer_usa_mls",
-    "Major League Soccer":  "soccer_usa_mls",
-    "Brazil Serie A":       "soccer_brazil_campeonato",
+    "MLS":                   "soccer_usa_mls",
+    "Major League Soccer":   "soccer_usa_mls",
+    "Brazil Serie A":        "soccer_brazil_campeonato",
     "Argentina Primera Division": "soccer_argentina_primera_division",
+    "World Cup":             "soccer_fifa_world_cup",
+    "FIFA World Cup":        "soccer_fifa_world_cup",
 }
 
-# Markets we care about and their Odds API equivalents
-MARKET_MAP = {
-    "Over/Under 1.5 Goals":  ("totals", "1.5"),
-    "Over/Under 2.5 Goals":  ("totals", "2.5"),
-    "Over/Under 3.5 Goals":  ("totals", "3.5"),
-    "Over/Under 4.5 Goals":  ("totals", "4.5"),
-    "BTTS Yes":              ("btts",   "Yes"),
-    "BTTS No":               ("btts",   "No"),
-}
+# Core bulk market — ALWAYS valid on /sports/{key}/odds.
+# (h2h + totals are the only markets guaranteed on the bulk endpoint for soccer.)
+BULK_MARKETS = "totals"
 
 # Preferred bookmakers (highest reliability)
 PREFERRED_BOOKMAKERS = [
@@ -53,207 +59,219 @@ PREFERRED_BOOKMAKERS = [
     "1xbet", "betano", "marathonbet",
 ]
 
+# Cache lifetime for a league's odds snapshot (seconds)
+LEAGUE_CACHE_TTL = int(os.getenv("ODDS_CACHE_TTL", "900"))  # 15 min
+
 
 class OddsFetcher:
-    """Fetches real-time odds from The Odds API."""
+    """Fetches real-time odds from The Odds API (quota-efficient)."""
 
     BASE_URL = "https://api.the-odds-api.com/v4"
 
     def __init__(self):
         self.api_key = os.getenv("ODDS_API_KEY", "")
-        self._cache: Dict[str, Dict] = {}
+        self.fetch_btts = os.getenv("ODDS_FETCH_BTTS", "false").lower() == "true"
+        # Cache keyed by sport_key -> {"ts": epoch, "events": [...]}
+        self._league_cache: Dict[str, Dict] = {}
+        # Track quota from the last response
+        self.requests_remaining: Optional[str] = None
 
+    # ── League key resolution ──────────────────────────────────────
     def _get_sport_key(self, league_name: str) -> Optional[str]:
-        """Find the Odds API sport key for a given league name."""
-        league_lower = league_name.lower()
+        league_lower = (league_name or "").lower()
         for our_name, sport_key in LEAGUE_MAP.items():
             if our_name.lower() in league_lower or league_lower in our_name.lower():
                 return sport_key
         return None
 
-    def get_odds_for_match(self, home: str, away: str, league: str) -> Dict:
+    # ── Bulk league fetch (cached) ─────────────────────────────────
+    def _fetch_league_events(self, sport_key: str) -> List[Dict]:
         """
-        Fetch real odds for a specific match.
-        Returns odds for all allowed markets.
+        Fetch ALL events+odds for a league in ONE request, cached for
+        LEAGUE_CACHE_TTL. This is the core quota-saving change: 10 matches
+        in the same league now cost 1 request, not 10.
         """
-        if not self.api_key:
-            return {}
-
-        sport_key = self._get_sport_key(league)
-        if not sport_key:
-            return {}
-
-        # Check cache first
-        cache_key = f"{sport_key}_{home}_{away}"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        now = time.time()
+        cached = self._league_cache.get(sport_key)
+        if cached and (now - cached["ts"]) < LEAGUE_CACHE_TTL:
+            return cached["events"]
 
         try:
             r = requests.get(
                 f"{self.BASE_URL}/sports/{sport_key}/odds",
                 params={
-                    "apiKey": self.api_key,
-                    "regions": "uk,eu,us",
-                    "markets": "totals,btts",
+                    "apiKey":     self.api_key,
+                    "regions":    "uk,eu",
+                    "markets":    BULK_MARKETS,        # ← FIX: totals only, no btts
                     "oddsFormat": "decimal",
-                    "bookmakers": ",".join(PREFERRED_BOOKMAKERS[:5]),
                 },
-                timeout=8,
+                timeout=10,
             )
 
-            if r.status_code != 200:
-                print(f"[OddsFetcher] HTTP {r.status_code} for {sport_key}")
-                return {}
+            self.requests_remaining = r.headers.get("x-requests-remaining", "?")
 
-            # Log remaining requests
-            remaining = r.headers.get("x-requests-remaining", "?")
-            print(f"[OddsFetcher] Odds API requests remaining: {remaining}")
+            if r.status_code != 200:
+                # FIX: log the actual body so any future error is diagnosable
+                print(f"[OddsFetcher] HTTP {r.status_code} for {sport_key} "
+                      f"| body: {r.text[:200]} | remaining: {self.requests_remaining}")
+                # Cache an empty result briefly to avoid hammering on errors
+                self._league_cache[sport_key] = {"ts": now, "events": []}
+                return []
 
             events = r.json()
-            result = self._find_match_odds(events, home, away)
-            if result:
-                self._cache[cache_key] = result
-            return result
+            print(f"[OddsFetcher] {sport_key}: {len(events)} events "
+                  f"| quota remaining: {self.requests_remaining}")
+            self._league_cache[sport_key] = {"ts": now, "events": events}
+            return events
 
         except Exception as e:
-            print(f"[OddsFetcher] Error: {e}")
+            print(f"[OddsFetcher] Error fetching {sport_key}: {type(e).__name__}: {e}")
+            return []
+
+    # ── Per-event BTTS (optional, quota-expensive) ─────────────────
+    def _fetch_event_btts(self, sport_key: str, event_id: str) -> Dict[str, float]:
+        """
+        Fetch BTTS for a single event via the per-event endpoint.
+        Only used when ODDS_FETCH_BTTS=true (1 request per event — costly).
+        """
+        if not self.fetch_btts or not event_id:
+            return {}
+        try:
+            r = requests.get(
+                f"{self.BASE_URL}/sports/{sport_key}/events/{event_id}/odds",
+                params={
+                    "apiKey":     self.api_key,
+                    "regions":    "uk,eu",
+                    "markets":    "btts",
+                    "oddsFormat": "decimal",
+                },
+                timeout=10,
+            )
+            self.requests_remaining = r.headers.get("x-requests-remaining", self.requests_remaining)
+            if r.status_code != 200:
+                return {}
+            data = r.json()
+            out: Dict[str, float] = {}
+            for bk in data.get("bookmakers", []):
+                for m in bk.get("markets", []):
+                    if m.get("key") == "btts":
+                        for o in m.get("outcomes", []):
+                            name = o.get("name", "")      # "Yes" / "No"
+                            price = o.get("price", 0)
+                            key = f"BTTS {name}"
+                            if key not in out or price < out[key]:
+                                out[key] = round(price, 2)
+            return out
+        except Exception:
             return {}
 
-    def _norm(self, s: str) -> str:
-        """Normalise team name for fuzzy comparison."""
-        return (s.lower()
-            .replace("fc", "").replace("sc", "").replace("ac", "")
-            .replace("afc", "").replace("cf", "").replace("city", "")
-            .replace("united", "utd").replace("hotspur", "")
-            .replace("&", "and").replace(".", "")
-            .replace("-", " ").strip()
-            .replace("  ", " ").replace(" ", ""))
+    # ── Team-name matching ─────────────────────────────────────────
+    GENERIC_WORDS = {
+        "city", "united", "town", "real", "club", "sporting", "athletic",
+        "county", "rovers", "wanderers", "albion", "fc", "afc", "sc", "cf",
+        "calcio", "deportivo", "atletico",
+    }
 
-    def _teams_match(self, name1: str, name2: str) -> bool:
-        """Check if two team names refer to the same team."""
-        n1 = self._norm(name1)
-        n2 = self._norm(name2)
-        if n1 == n2:
+    def _norm(self, s: str) -> str:
+        """Lowercase and strip common trailing club suffixes (whole-word only,
+        so names like 'Ascoli'/'Schalke' are NOT corrupted)."""
+        s = (s or "").lower().replace(".", "").strip()
+        for suffix in (" fc", " afc", " sc", " cf", " sd", " ac", " cd"):
+            if s.endswith(suffix):
+                s = s[: -len(suffix)].strip()
+        return s
+
+    def _side_match(self, q: str, e: str) -> bool:
+        """True if query team name `q` plausibly refers to event team name `e`."""
+        nq, ne = self._norm(q), self._norm(e)
+        qc, ec = nq.replace(" ", ""), ne.replace(" ", "")
+        if not qc or not ec:
+            return False
+        # 1) direct containment ("Arsenal" ⊂ "Arsenal FC")
+        if qc in ec or ec in qc:
             return True
-        # One contains the other
-        if n1 in n2 or n2 in n1:
+        # 2) first-token prefix ("Man" → "Manchester")
+        qt = nq.split()[0] if nq.split() else ""
+        et = ne.split()[0] if ne.split() else ""
+        if qt and et and min(len(qt), len(et)) >= 3 and (qt.startswith(et) or et.startswith(qt)):
             return True
-        # First 5 chars match
-        if len(n1) >= 5 and len(n2) >= 5 and n1[:5] == n2[:5]:
+        # 3) shared distinctive (non-generic) word ("Tottenham Hotspur" ↔ "Tottenham")
+        wq = {w for w in nq.split() if len(w) >= 4 and w not in self.GENERIC_WORDS}
+        we = {w for w in ne.split() if len(w) >= 4 and w not in self.GENERIC_WORDS}
+        if wq & we:
             return True
-        # Check word overlap
-        words1 = set(name1.lower().split())
-        words2 = set(name2.lower().split())
-        # Remove common words
-        common_words = {"fc", "sc", "ac", "cf", "city", "united", "utd", "the", "de", "of"}
-        words1 -= common_words
-        words2 -= common_words
-        if words1 and words2:
-            overlap = words1 & words2
-            if len(overlap) >= 1 and max(len(w) for w in overlap) >= 4:
-                return True
         return False
 
-    def _find_match_odds(self, events: List[Dict], home: str, away: str) -> Dict:
-        """Find matching event using flexible name matching."""
+    def _teams_match(self, qhome, qaway, ehome, eaway) -> bool:
+        return self._side_match(qhome, ehome) and self._side_match(qaway, eaway)
+
+    # ── Extract odds for one match from the cached league events ───
+    def get_odds_for_match(self, home: str, away: str, league: str) -> Dict:
+        if not self.api_key:
+            return {}
+        sport_key = self._get_sport_key(league)
+        if not sport_key:
+            return {}
+
+        events = self._fetch_league_events(sport_key)
+        if not events:
+            return {}
+
         for event in events:
-            ev_home = event.get("home_team", "")
-            ev_away = event.get("away_team", "")
-
-            home_match = self._teams_match(home, ev_home)
-            away_match = self._teams_match(away, ev_away)
-
-            if not (home_match and away_match):
+            if not self._teams_match(home, away,
+                                     event.get("home_team", ""),
+                                     event.get("away_team", "")):
                 continue
 
-            # Extract odds from bookmakers
-            odds_data = {}
+            odds_data: Dict[str, float] = {}
             for bookmaker in event.get("bookmakers", []):
                 for market in bookmaker.get("markets", []):
-                    market_key = market.get("key", "")
-
-                    if market_key == "totals":
+                    if market.get("key") == "totals":
                         for outcome in market.get("outcomes", []):
                             point = str(outcome.get("point", ""))
-                            name = outcome.get("name", "")
+                            name  = outcome.get("name", "")   # "Over" / "Under"
                             price = outcome.get("price", 0)
                             key = f"{name} {point} Goals"
-                            # Keep best (lowest) odds across bookmakers
+                            # keep best (lowest) price = most conservative
                             if key not in odds_data or price < odds_data[key]:
                                 odds_data[key] = round(price, 2)
 
-                    elif market_key == "btts":
-                        for outcome in market.get("outcomes", []):
-                            name = outcome.get("name", "")
-                            price = outcome.get("price", 0)
-                            key = f"BTTS {name}"
-                            if key not in odds_data or price < odds_data[key]:
-                                odds_data[key] = round(price, 2)
+            # Optional BTTS enrichment (per-event, only if explicitly enabled)
+            if self.fetch_btts:
+                odds_data.update(self._fetch_event_btts(sport_key, event.get("id", "")))
 
             if odds_data:
-                print(f"[OddsFetcher] Matched: {home} vs {away} -> {ev_home} vs {ev_away}")
-                print(f"[OddsFetcher] Markets found: {list(odds_data.keys())}")
                 return {
-                    "home": ev_home,
-                    "away": ev_away,
+                    "home":          event.get("home_team"),
+                    "away":          event.get("away_team"),
                     "commence_time": event.get("commence_time"),
-                    "odds": odds_data,
+                    "odds":          odds_data,
                 }
 
         return {}
 
+    # ── Pick → odds resolution ─────────────────────────────────────
     def get_best_odds(self, pick: str, odds_data: Dict) -> Optional[float]:
-        """
-        Find real bookmaker odds for a given pick.
-        e.g. "Over 2.5 Goals" -> looks for "Over 2.5 Goals" in odds_data
-        """
-        if not odds_data or not odds_data.get("odds"):
+        if not odds_data:
             return None
-
-        pick_lower = pick.lower().strip()
-        available = odds_data.get("odds", {})
-
-        # Try exact match first
-        for market_name, price in available.items():
-            if market_name.lower() == pick_lower:
+        pick_lower = (pick or "").lower()
+        for market_name, price in odds_data.get("odds", {}).items():
+            if market_name.lower() in pick_lower or pick_lower in market_name.lower():
                 return price
-
-        # Try: "Over 2.5 Goals" matches "Over 2.5 Goals"
-        for market_name, price in available.items():
-            m_lower = market_name.lower()
-            if pick_lower in m_lower or m_lower in pick_lower:
+        # partial token match (e.g. "over" + "2.5")
+        for market_name, price in odds_data.get("odds", {}).items():
+            parts = [p for p in pick_lower.split() if len(p) > 2]
+            if parts and all(p in market_name.lower() for p in parts):
                 return price
-
-        # Try extracting number: "Over 2.5" from "Over 2.5 Goals"
-        import re
-        pick_num = re.search(r'(\d+\.?\d*)', pick)
-        pick_dir = "over" if "over" in pick_lower else "under" if "under" in pick_lower else ""
-        if pick_num and pick_dir:
-            num = pick_num.group(1)
-            for market_name, price in available.items():
-                m_lower = market_name.lower()
-                if pick_dir in m_lower and num in m_lower:
-                    return price
-
-        # BTTS matching
-        if "btts" in pick_lower or "both teams" in pick_lower:
-            yes_no = "yes" if "yes" in pick_lower else "no" if "no" in pick_lower else ""
-            for market_name, price in available.items():
-                if "btts" in market_name.lower() and yes_no in market_name.lower():
-                    return price
-
         return None
 
+    # ── Enrich a batch of tips with real odds ──────────────────────
     def enrich_tips_with_odds(self, tips: List[Dict]) -> List[Dict]:
-        """
-        Add real bookmaker odds to each tip.
-        Replaces estimated odds_range with real odds.
-        """
         for tip in tips:
             home, away = self._split_match(tip.get("match", ""))
             league = tip.get("league", "")
-
             if not home or not away:
+                tip["real_odds_available"] = False
                 continue
 
             odds_data = self.get_odds_for_match(home, away, league)
@@ -263,15 +281,15 @@ class OddsFetcher:
 
             real_odds = self.get_best_odds(tip.get("pick", ""), odds_data)
             if real_odds:
-                tip["bookmaker_odds"] = real_odds
+                tip["bookmaker_odds"]      = real_odds
                 tip["real_odds_available"] = True
-                tip["odds_source"] = "The Odds API (Live)"
-                # Recalculate value with real odds
-                prob = tip.get("predicted_probability", 0)
+                tip["odds_source"]         = "The Odds API (Live)"
+                prob = tip.get("predicted_probability", 0) or tip.get("predicted_prob", 0)
                 if prob and real_odds:
                     value = (prob * real_odds) - 1
-                    tip["value"] = round(value, 4)
-                    tip["edge_pct"] = f"+{value*100:.1f}%" if value > 0 else f"{value*100:.1f}%"
+                    tip["value"]       = round(value, 4)
+                    tip["edge_pct"]    = (f"+{value*100:.1f}%" if value > 0
+                                          else f"{value*100:.1f}%")
                     tip["is_value_bet"] = value >= 0.05
             else:
                 tip["real_odds_available"] = False
@@ -279,8 +297,7 @@ class OddsFetcher:
         return tips
 
     def _split_match(self, match_str: str):
-        """Split 'Team A vs Team B' into (home, away)."""
-        parts = match_str.split(" vs ")
+        parts = (match_str or "").split(" vs ")
         if len(parts) == 2:
             return parts[0].strip(), parts[1].strip()
         return None, None
