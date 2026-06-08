@@ -61,7 +61,19 @@ def refresh_model(
 ) -> dict:
     """Refit the Dixon-Coles model from football.db. Safe to call from a scheduler."""
     global _MODEL
-    matches = load_matches_from_sqlite(_DB_PATH, league_id=league_id)
+    matches = load_matches_from_sqlite(
+        _DB_PATH,
+        table="fixtures",
+        league_id=league_id,
+        columns={
+            "home_team": "home_team",
+            "away_team": "away_team",
+            "home_goals": "home_goals",
+            "away_goals": "away_goals",
+            "match_date": "date",
+            "league_id": "league_id",
+        },
+    )
     if len(matches) < 5:
         raise HTTPException(
             status_code=422,
