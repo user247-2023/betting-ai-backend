@@ -164,6 +164,10 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
 )
 
+# Goals-market router (Dixon-Coles model, value detection, CLV) — Tier 1-3
+from services.api.goals_market_router import router as goals_router
+app.include_router(goals_router)
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
