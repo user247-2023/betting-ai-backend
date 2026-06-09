@@ -42,14 +42,29 @@ router = APIRouter(prefix="/api/goals", tags=["goals-model"])
 _MODEL: Optional[DixonColesModel] = None
 _DB_PATH = os.getenv("FOOTBALL_DB", "database/football.db")
 _CLV = CLVTracker(db_path=os.getenv("CLV_DB", "database/clv.db"))
+_DEFAULT_LEAGUE = int(os.getenv("GOALS_DEFAULT_LEAGUE", "39"))  # 39 = Premier League
 
 
 def get_model() -> DixonColesModel:
-    if _MODEL is None or not _MODEL.fitted:
+    """
+    Return the fitted model, fitting it automatically on first use.
+
+    The model lives in memory, so any restart (deploy, or the host sleeping and
+    waking) leaves it empty. Rather than require a manual refresh each time, we
+    fit it on demand from football.db for the default league the first time it's
+    needed, then keep it cached until the next restart. No console step needed.
+    """
+    global _MODEL
+    if _MODEL is not None and _MODEL.fitted:
+        return _MODEL
+    try:
+        refresh_model(league_id=_DEFAULT_LEAGUE)
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(
             status_code=503,
-            detail="Goals model not fitted yet. POST /api/goals/refresh "
-                   "(needs >=5 settled matches in football.db).",
+            detail=f"Goals model could not auto-fit from football.db: {e}",
         )
     return _MODEL
 
@@ -116,7 +131,7 @@ def status() -> dict:
     if _MODEL is not None and _MODEL.fitted:
         return {"fitted": True, **_MODEL.summary(), "db_path": _DB_PATH}
     return {"fitted": False, "db_path": _DB_PATH,
-            "hint": "POST /api/goals/refresh to fit from football.db"}
+            "note": "Model fits automatically on the first prediction; no action needed."}
 
 
 @router.post("/refresh")
