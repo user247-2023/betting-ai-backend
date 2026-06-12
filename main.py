@@ -168,6 +168,10 @@ app.add_middleware(
 from services.api.goals_market_router import router as goals_router
 app.include_router(goals_router)
 
+# Live layer — upcoming fixtures + multi-book odds (The Odds API, budgeted)
+from services.api.live_router import router as live_router
+app.include_router(live_router)
+
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
