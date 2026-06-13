@@ -28,6 +28,7 @@ from fastapi import APIRouter, HTTPException, Query
 from services.api.goals_market_router import get_model, _MODELS
 from services.data_service import live_data, team_matcher
 from services.decision_engine.goals_value import find_goals_value
+from services.decision_engine import market_blend
 
 router = APIRouter(prefix="/api/live", tags=["live"])
 
@@ -90,18 +91,24 @@ def _ensure_fresh(force: bool = False) -> list[str]:
     return notes
 
 
-def _slim_prediction(model, home: str, away: str) -> dict | None:
+def _readout(model, home: str, away: str, books: dict, league_id: int) -> dict | None:
+    """Model + market consensus + blended prediction + double chance + tips.
+
+    World Cup matches (league 1) are treated as neutral-venue, so the model's
+    home-advantage term is dropped — the single biggest accuracy fix for the
+    tournament. The blended prediction (model + de-vigged market) is the most
+    accurate single forecast; the pure model and the model-vs-market edge ride
+    alongside it so value-finding stays intact.
+    """
     try:
-        full = model.predict_markets(home, away).as_dict()
+        return market_blend.full_readout(
+            model, home, away,
+            books=books,
+            neutral=(league_id == 1),
+            league_id=league_id,
+        )
     except KeyError:
         return None
-    return {
-        "1x2": full["1x2"],
-        "expected_goals": full["expected_goals"],
-        "over_under_2_5": full["over_under"]["2.5"],
-        "btts": full["btts"],
-        "top_score": (full.get("correct_score") or [None])[0],
-    }
 
 
 # --------------------------------------------------------------------------- #
@@ -125,8 +132,9 @@ def live_matches(
             try:
                 if lid not in model_cache:
                     model_cache[lid] = get_model(lid)
-                pred = _slim_prediction(
-                    model_cache[lid], ev["home_model"], ev["away_model"]
+                pred = _readout(
+                    model_cache[lid], ev["home_model"], ev["away_model"],
+                    ev["books"], lid,
                 )
             except Exception as e:
                 notes.append(f"model league {lid}: {e}")
@@ -207,6 +215,16 @@ def live_value(
         "snapshot_age_min": ev["snapshot_age_min"],
         "feed_names": {"home": ev["home_src"], "away": ev["away_src"]},
     }
+
+    # Blended prediction + double chance + plain-language tips alongside value
+    readout = _readout(model, ev["home_model"], ev["away_model"], ev["books"], ev["league_id"])
+    if readout:
+        result["prediction_1x2"] = readout["prediction_1x2"]
+        result["model_1x2"] = readout["model_1x2"]
+        result["market_1x2"] = readout.get("market_1x2")
+        result["double_chance"] = readout["double_chance"]
+        result["tips"] = readout["tips"]
+        result["neutral_venue"] = readout["neutral_venue"]
     return result
 
 
