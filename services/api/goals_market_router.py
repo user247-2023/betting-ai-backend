@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 from services.ml_service.dixon_coles import DixonColesModel, load_matches_from_sqlite
 from services.decision_engine.goals_value import find_goals_value
 from services.decision_engine.clv_tracker import CLVTracker
+from services.decision_engine import market_blend
 
 router = APIRouter(prefix="/api/goals", tags=["goals-model"])
 
@@ -207,15 +208,26 @@ def predict(
     home_team: str = Query(..., description="Exact team name as stored during fit"),
     away_team: str = Query(...),
     league: int = Query(_DEFAULT_LEAGUE, description="Competition the teams play in"),
+    neutral: bool = Query(False, description="Neutral venue (drops home advantage)"),
     top_n_scores: int = Query(5, ge=1, le=20),
 ) -> dict:
     model = get_model(league)
     try:
-        out = model.predict_markets(home_team, away_team, top_n_scores).as_dict()
-        out["league"] = league
-        return out
+        if neutral:
+            lh, la = market_blend.neutral_lambdas(model, home_team, away_team)
+            out = model.predict_markets_from_lambdas(
+                home_team, away_team, lh, la, top_n_scores
+            ).as_dict()
+        else:
+            out = model.predict_markets(home_team, away_team, top_n_scores).as_dict()
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    out["league"] = league
+    out["neutral_venue"] = neutral
+    p = [out["1x2"]["home"], out["1x2"]["draw"], out["1x2"]["away"]]
+    out["double_chance"] = market_blend.double_chance(p)
+    out["tips"] = market_blend.make_tips(p, home_team, away_team)
+    return out
 
 
 @router.post("/value")
