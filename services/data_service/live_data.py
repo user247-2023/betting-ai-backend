@@ -106,6 +106,29 @@ def _conn() -> sqlite3.Connection:
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS predictions (
+            event_id    TEXT PRIMARY KEY,
+            logged_at   TEXT,
+            league_id   INTEGER,
+            kickoff     TEXT,
+            home_model  TEXT,
+            away_model  TEXT,
+            model_h REAL, model_d REAL, model_a REAL,
+            blend_h REAL, blend_d REAL, blend_a REAL,
+            market_h REAL, market_d REAL, market_a REAL,
+            pick        TEXT,      -- 'home' / 'draw' / 'away' (blended argmax)
+            pick_prob   REAL,
+            confidence  TEXT,
+            settled     INTEGER DEFAULT 0,
+            actual      TEXT,
+            actual_score TEXT,
+            correct     INTEGER,
+            mkt_correct INTEGER,   -- did the market favourite hit (benchmark)
+            brier_model  REAL,
+            brier_blend  REAL,
+            brier_market REAL,
+            settled_at  TEXT
+        );
         """
     )
     return con
@@ -549,3 +572,205 @@ def apifootball_test() -> dict:
             "primary live source here."
         ),
     }
+
+
+# --------------------------------------------------------------------------- #
+#  Predictions ledger — the scorecard ("does this actually work?")            #
+# --------------------------------------------------------------------------- #
+#
+#  log_predictions()    freezes each pre-kickoff prediction (model / blended /
+#                       market probabilities + the pick) keyed by event.
+#  settle_predictions() matches finished fixtures (fed for free by the results
+#                       river) back to logged predictions and grades them:
+#                       did the blended pick hit, and what Brier score did the
+#                       model, the blend, and the market each earn.
+#  scorecard()          aggregates the graded rows into an honest report —
+#                       crucially, whether the blend beats the raw market.
+
+def _argmax_outcome(h: float, d: float, a: float) -> str:
+    return "home" if h >= d and h >= a else "draw" if d >= a else "away"
+
+
+def _brier(probs: dict, actual: str) -> float:
+    y = {"home": 0.0, "draw": 0.0, "away": 0.0}
+    y[actual] = 1.0
+    return sum((probs[k] - y[k]) ** 2 for k in y)
+
+
+def log_predictions(matches: list[dict]) -> int:
+    """Freeze the current pre-kickoff prediction for each matched fixture.
+
+    Cheap and local (no API). Safe to call on every /matches request — rows are
+    upserted by event, so a fixture's stored prediction is its latest read
+    before kickoff. Once a match starts it stops appearing in /matches, so the
+    row naturally freezes. Never overwrites a row already settled.
+    """
+    logged = 0
+    con = _conn()
+    try:
+        for m in matches:
+            if not m.get("matched") or m.get("started"):
+                continue
+            p = m.get("prediction") or {}
+            blend = p.get("prediction_1x2") or p.get("model_1x2")
+            model = p.get("model_1x2")
+            market = p.get("market_1x2")
+            if not blend or not model:
+                continue
+            pick = _argmax_outcome(blend["home"], blend["draw"], blend["away"])
+            pick_prob = blend[pick]
+            conf = (p.get("tips") or {}).get("result_pick", {}).get("confidence")
+            con.execute(
+                """INSERT INTO predictions
+                   (event_id, logged_at, league_id, kickoff, home_model, away_model,
+                    model_h, model_d, model_a, blend_h, blend_d, blend_a,
+                    market_h, market_d, market_a, pick, pick_prob, confidence, settled)
+                   VALUES (?,?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?, 0)
+                   ON CONFLICT(event_id) DO UPDATE SET
+                     logged_at=excluded.logged_at, kickoff=excluded.kickoff,
+                     model_h=excluded.model_h, model_d=excluded.model_d, model_a=excluded.model_a,
+                     blend_h=excluded.blend_h, blend_d=excluded.blend_d, blend_a=excluded.blend_a,
+                     market_h=excluded.market_h, market_d=excluded.market_d, market_a=excluded.market_a,
+                     pick=excluded.pick, pick_prob=excluded.pick_prob, confidence=excluded.confidence
+                   WHERE predictions.settled = 0""",
+                (
+                    m["event_id"], _now().isoformat(), m["league_id"], m.get("kickoff"),
+                    m["home"], m["away"],
+                    model["home"], model["draw"], model["away"],
+                    blend["home"], blend["draw"], blend["away"],
+                    (market or {}).get("home"), (market or {}).get("draw"), (market or {}).get("away"),
+                    pick, pick_prob, conf,
+                ),
+            )
+            logged += 1
+        con.commit()
+    finally:
+        con.close()
+    return logged
+
+
+def settle_predictions() -> int:
+    """Grade pending predictions whose result has since landed. Returns #graded."""
+    graded = 0
+    con = _conn()
+    try:
+        pending = con.execute(
+            "SELECT event_id, league_id, kickoff, home_model, away_model, "
+            "model_h, model_d, model_a, blend_h, blend_d, blend_a, "
+            "market_h, market_d, market_a FROM predictions WHERE settled = 0"
+        ).fetchall()
+        for row in pending:
+            (event_id, league_id, kickoff, home, away,
+             mh, md, ma, bh, bd, ba, kh, kd, ka) = row
+            day = (kickoff or "")[:10]
+            if not day:
+                continue
+            fx = con.execute(
+                "SELECT home_goals, away_goals FROM fixtures "
+                "WHERE league_id=? AND home_team=? AND away_team=? "
+                "AND date BETWEEN date(?, '-1 day') AND date(?, '+1 day') "
+                "AND home_goals IS NOT NULL ORDER BY date LIMIT 1",
+                (league_id, home, away, day, day),
+            ).fetchone()
+            if not fx:
+                continue
+            hg, ag = int(fx[0]), int(fx[1])
+            actual = "home" if hg > ag else "away" if ag > hg else "draw"
+            model = {"home": mh, "draw": md, "away": ma}
+            blend = {"home": bh, "draw": bd, "away": ba}
+            pick = _argmax_outcome(bh, bd, ba)
+            b_model = _brier(model, actual)
+            b_blend = _brier(blend, actual)
+            b_market = mkt_correct = None
+            if kh is not None and kd is not None and ka is not None:
+                market = {"home": kh, "draw": kd, "away": ka}
+                b_market = _brier(market, actual)
+                mkt_correct = 1 if _argmax_outcome(kh, kd, ka) == actual else 0
+            con.execute(
+                "UPDATE predictions SET settled=1, actual=?, actual_score=?, correct=?, "
+                "mkt_correct=?, brier_model=?, brier_blend=?, brier_market=?, settled_at=? "
+                "WHERE event_id=?",
+                (actual, f"{hg}-{ag}", 1 if pick == actual else 0, mkt_correct,
+                 b_model, b_blend, b_market, _now().isoformat(), event_id),
+            )
+            graded += 1
+        con.commit()
+    finally:
+        con.close()
+    return graded
+
+
+def scorecard() -> dict:
+    """Honest track record: accuracy, sharpness, and blend-vs-market."""
+    con = _conn()
+    try:
+        tracked = con.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+        rows = con.execute(
+            "SELECT league_id, correct, mkt_correct, brier_model, brier_blend, "
+            "brier_market, confidence FROM predictions WHERE settled=1"
+        ).fetchall()
+        recent = con.execute(
+            "SELECT home_model, away_model, pick, actual, actual_score, correct, kickoff "
+            "FROM predictions WHERE settled=1 ORDER BY settled_at DESC LIMIT 10"
+        ).fetchall()
+    finally:
+        con.close()
+
+    n = len(rows)
+    base = {
+        "tracked": tracked,
+        "settled": n,
+        "pending": tracked - n,
+        "recent": [
+            {
+                "match": f"{r[0]} v {r[1]}", "pick": r[2], "result": r[3],
+                "score": r[4], "hit": bool(r[5]), "kickoff": r[6],
+            }
+            for r in recent
+        ],
+    }
+    if n == 0:
+        base["message"] = (
+            "No graded predictions yet. The scorecard fills in as logged matches "
+            "finish and their results arrive — check back after the next kickoffs."
+        )
+        return base
+
+    def _rate(items):
+        items = [x for x in items if x is not None]
+        return round(sum(items) / len(items), 4) if items else None
+
+    correct = [r[1] for r in rows]
+    mkt_correct = [r[2] for r in rows]
+    b_model = [r[3] for r in rows]
+    b_blend = [r[4] for r in rows]
+    b_market = [r[5] for r in rows]
+
+    intl = [r for r in rows if r[0] == 1]
+    club = [r for r in rows if r[0] != 1]
+
+    bb, bm = _rate(b_blend), _rate(b_market)
+    base.update({
+        "hit_rate": _rate(correct),
+        "market_favourite_hit_rate": _rate(mkt_correct),
+        "brier": {"model": _rate(b_model), "blend": bb, "market": bm},
+        "blend_beats_market": (bb is not None and bm is not None and bb < bm),
+        "by_competition": {
+            "internationals": {
+                "settled": len(intl),
+                "hit_rate": _rate([r[1] for r in intl]),
+                "brier_blend": _rate([r[4] for r in intl]),
+            },
+            "clubs": {
+                "settled": len(club),
+                "hit_rate": _rate([r[1] for r in club]),
+                "brier_blend": _rate([r[4] for r in club]),
+            },
+        },
+        "note": (
+            "Hit rate = how often the blended top pick was correct. Brier is "
+            "sharpness (lower is better). 'blend_beats_market' compares the blended "
+            "forecast's Brier against the bookmakers' own — the real test of edge."
+        ),
+    })
+    return base
