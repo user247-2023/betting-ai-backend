@@ -155,6 +155,16 @@ def live_matches(
             }
         )
 
+    # Track record: freeze pre-kickoff predictions + grade any that finished.
+    # Both are cheap and local (no API); failures never break the listing.
+    try:
+        live_data.log_predictions(matches)
+        graded = live_data.settle_predictions()
+        if graded:
+            notes.append(f"scorecard: graded {graded} finished prediction(s)")
+    except Exception as e:
+        notes.append(f"scorecard logging skipped: {e}")
+
     return {
         "count": len(matches),
         "matches": matches,
@@ -285,6 +295,22 @@ def unmatched() -> dict:
     except Exception:
         items = []
     return {"count": len(items), "unmatched": items}
+
+
+@router.get("/scorecard")
+def scorecard() -> dict:
+    """The track record — accuracy, sharpness, and whether the blend beats the market."""
+    try:
+        live_data.settle_predictions()
+    except Exception:
+        pass
+    return live_data.scorecard()
+
+
+@router.post("/scorecard/settle")
+def scorecard_settle() -> dict:
+    graded = live_data.settle_predictions()
+    return {"graded": graded, **live_data.scorecard()}
 
 
 @router.get("/apifootball-test")
