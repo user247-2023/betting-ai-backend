@@ -135,19 +135,32 @@ class AIAnalyzer:
             "8. Stats: shots/game, corners/game, cards/game, clean sheets\n"
             "9. Coaching: rotation, tactical flexibility\n"
             "10. Conditions: fatigue, travel, weather, referee tendencies\n\n"
-            "MARKETS ALLOWED:\n"
-            "Over/Under 1.5/2.5/3.5/4.5 Goals | BTTS Yes/No | "
-            "1st Half Over 0.5/1.5 | 2nd Half Over 0.5/1.5 | "
-            "Over/Under 8.5/9.5/10.5/11.5 Corners | "
-            "Over/Under 3.5/4.5/5.5 Cards | Both Halves Over 0.5 | Clean Sheet\n\n"
-            "FORBIDDEN: match winner, double chance, correct score, goalscorer, handicap.\n\n"
+            "MARKETS ALLOWED — choose from any of these:\n"
+            "RESULT: Match Result (Home/Draw/Away) | Double Chance (1X/12/X2) | Draw No Bet\n"
+            "GOALS: Over/Under 0.5/1.5/2.5/3.5/4.5 Goals | BTTS Yes/No | Win to Nil | "
+            "Odd/Even Total Goals | Clean Sheet (Home/Away) | Correct Score | Team Over/Under Goals\n"
+            "HALVES: 1st Half Over 0.5/1.5 | 2nd Half Over 0.5/1.5 | Both Halves Over 0.5 | HT/FT\n"
+            "STATS & SPECIALS: Over/Under 8.5-12.5 Corners | Over/Under 3.5-6.5 Cards | "
+            "Over/Under Throw-ins | Total Shots | Fouls | Offsides\n\n"
+            "FORBIDDEN: individual goalscorer, player props, asian handicap with .25/.75 lines.\n\n"
+            "NOTE: throw-ins, shots, fouls and offsides have little reliable public data — only "
+            "suggest them when truly confident; they will be flagged experimental and can't be auto-settled.\n\n"
             "Generate up to 50 HIGH QUALITY tips — pick the best opportunities from the fixture list. Cover a variety of leagues AND markets. Quality over quantity — only include tips with strong supporting stats.\n"
             "reasoning: 3-4 sentences with specific stats.\n"
             "key_stats: 4-5 data points.\n"
             "confidence: 65-92. risk: LOW(80+), MEDIUM(65-79), HIGH(<65).\n\n"
+            "ALSO include these settlement fields on every tip (REQUIRED):\n"
+            "  home_team, away_team: the two sides, exactly as written in the fixture.\n"
+            "  settle_type: ONE of goals_ou, btts, result, double_chance, dnb, win_to_nil, "
+            "odd_even, clean_sheet, correct_score, team_goals, manual. "
+            "Use 'manual' for corners, cards, halves, throw-ins, shots, fouls, offsides.\n"
+            "  line: the numeric line if the market has one (e.g. 2.5), else null.\n"
+            "  side: a short code — over/under, yes/no, home/draw/away, 1x/12/x2, odd/even — else null.\n\n"
             "Return ONLY a JSON array. Start with [ end with ]. No markdown.\n\n"
-            '[{"match":"Team A vs Team B","league":"League (Country)","time":"HH:MM GMT",'
+            '[{"match":"Team A vs Team B","home_team":"Team A","away_team":"Team B",'
+            '"league":"League (Country)","time":"HH:MM GMT",'
             '"market":"Over/Under 2.5 Goals","pick":"Over 2.5 Goals",'
+            '"settle_type":"goals_ou","line":2.5,"side":"over",'
             '"odds_range":"1.80-2.00","confidence":84,'
             '"reasoning":"Stats here.","key_stats":["s1","s2","s3","s4"],"risk":"LOW"}]'
         )
@@ -226,6 +239,11 @@ class AIAnalyzer:
                 "key_stats": t.get("key_stats") or t.get("stats") or [],
                 "risk": t.get("risk", "MEDIUM"),
                 "ai_source": ai_name,
+                "home_team": t.get("home_team") or "",
+                "away_team": t.get("away_team") or "",
+                "settle_type": t.get("settle_type") or "manual",
+                "line": t.get("line"),
+                "side": t.get("side") or None,
             })
 
         return tips, f"{ai_name}: {len(tips)} tips"
