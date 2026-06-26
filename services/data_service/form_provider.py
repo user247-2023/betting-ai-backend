@@ -216,3 +216,68 @@ def build_prompt_data(fixtures: List[Dict], date: str, max_fixtures: int = _MAX_
             "Do NOT generate any tips."
         )
     return "\n\n".join(blocks)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model layer: expose each fixture's REAL scoring rates so a statistical model
+# (Dixon-Coles) can compute true market probabilities instead of relying on the
+# AI's self-reported confidence. Same data source as above — zero API calls.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Competitions played at neutral venues (no home advantage applied).
+_NEUTRAL_HINTS = ("world cup", "friendl", "club world", "olympic", "nations league final")
+
+
+def normalize_key(name: str) -> str:
+    """Stable key for a team name (case/punctuation-insensitive)."""
+    return "".join(ch for ch in (name or "").lower() if ch.isalnum())
+
+
+def fixture_key(home: str, away: str) -> str:
+    """Join key for a fixture, matching how AI tips identify home/away teams."""
+    return normalize_key(home) + "|" + normalize_key(away)
+
+
+def _is_neutral(fx: Dict) -> bool:
+    blob = f"{fx.get('league','')} {fx.get('country','')}".lower()
+    return any(h in blob for h in _NEUTRAL_HINTS)
+
+
+def fixture_rates(fixtures: List[Dict], date: str) -> Dict[str, Dict]:
+    """
+    For each fixture with real data, return the scoring rates the model needs:
+      { fixture_key: {home_team, away_team, home_gf, home_ga, home_n,
+                      away_gf, away_ga, away_n, neutral} }
+    Fixtures without enough data on both sides are omitted.
+    """
+    try:
+        conn = _conn()
+    except Exception:
+        return {}
+
+    out: Dict[str, Dict] = {}
+    try:
+        for fx in fixtures:
+            try:
+                league_id = fx.get("league_id", 0)
+                home = _db_name(conn, fx.get("home", ""), league_id)
+                away = _db_name(conn, fx.get("away", ""), league_id)
+                if not home or not away:
+                    continue
+                before = fx.get("date") or "9999-99-99"
+                ha = _aggregate(_recent(conn, home, before, _RECENT_N))
+                aa = _aggregate(_recent(conn, away, before, _RECENT_N))
+                if not ha or not aa or ha["n"] < 3 or aa["n"] < 3:
+                    continue
+                out[fixture_key(fx.get("home", ""), fx.get("away", ""))] = {
+                    "home_team": fx.get("home", ""),
+                    "away_team": fx.get("away", ""),
+                    "home_gf": ha["avg_gf"], "home_ga": ha["avg_ga"], "home_n": ha["n"],
+                    "away_gf": aa["avg_gf"], "away_ga": aa["avg_ga"], "away_n": aa["n"],
+                    "neutral": _is_neutral(fx),
+                }
+            except Exception:
+                continue
+    finally:
+        conn.close()
+    return out
