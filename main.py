@@ -263,8 +263,9 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
 
     # Build REAL pre-match data (recent form, H2H, goals) from the local DB.
     # This grounds the AI in actual results so it cannot fabricate statistics.
-    from services.data_service.form_provider import build_prompt_data
+    from services.data_service.form_provider import build_prompt_data, fixture_rates
     fixture_text = build_prompt_data(fixtures, today)
+    rates_map    = fixture_rates(fixtures, today)   # real scoring rates for the model
 
     # ── STEP 2: Smart AI Routing decision ───────────────────────
     available_ais = ["claude", "gemini", "groq"]
@@ -318,6 +319,18 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
                 logger.info(f"[Main] ML enriched {len(tips)} tips")
         except Exception as e:
             logger.warning(f"[Main] ML enrichment failed: {e}")
+
+    # ── STEP 5b: Model probabilities (Dixon-Coles on real scoring rates) ──
+    # Replace AI-confidence-derived probabilities with a transparent statistical
+    # model for every supported goals/result market, so the downstream value/edge
+    # (edge = probability * odds - 1) reflects real data, not the AI's optimism.
+    try:
+        from services.ml_service.model_probs import enrich as model_enrich
+        tips = model_enrich(tips, rates_map)
+        n_model = sum(1 for t in tips if t.get("prob_source") == "model")
+        logger.info(f"[ModelProbs] Dixon-Coles probabilities on {n_model}/{len(tips)} tips")
+    except Exception as e:
+        logger.warning(f"[ModelProbs] Failed: {e}")
 
     # ── STEP 6: Real odds enrichment ────────────────────────────
     if ODDS_ENABLED and odds_fetcher and os.getenv("ODDS_API_KEY"):
