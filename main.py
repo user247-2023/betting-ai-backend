@@ -261,7 +261,10 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
             "message": f"No matches in your leagues for {today}.",
         }
 
-    fixture_text = data_svc.format_for_prompt(fixtures)
+    # Build REAL pre-match data (recent form, H2H, goals) from the local DB.
+    # This grounds the AI in actual results so it cannot fabricate statistics.
+    from services.data_service.form_provider import build_prompt_data
+    fixture_text = build_prompt_data(fixtures, today)
 
     # ── STEP 2: Smart AI Routing decision ───────────────────────
     available_ais = ["claude", "gemini", "groq"]
