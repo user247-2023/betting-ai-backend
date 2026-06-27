@@ -6,6 +6,7 @@ import requests
 import json
 import re
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Tuple
 
@@ -52,9 +53,10 @@ def _call_gemini_sync(prompt: str) -> str:
         print("[Gemini] No key in env")
         return "ERR:no_key"
     try:
-        print(f"[Gemini] Calling with key starting {key[:12]}...")
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # 2.0 retired June 2026
+        print(f"[Gemini] Calling {model} with key starting {key[:12]}...")
         r = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={key}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
@@ -194,17 +196,86 @@ def _call_openrouter_sync(prompt: str) -> str:
     )
 
 
+def _call_cerebras_sync(prompt: str) -> str:
+    """Cerebras: FREE, no credit card, extremely fast. Needs CEREBRAS_API_KEY.
+    Model via CEREBRAS_MODEL (default llama-3.3-70b). Get a key at cloud.cerebras.ai."""
+    return _call_openai_compatible(
+        prompt,
+        url="https://api.cerebras.ai/v1/chat/completions",
+        key_env="CEREBRAS_API_KEY",
+        model=os.getenv("CEREBRAS_MODEL", "llama-3.3-70b"),
+        label="Cerebras",
+    )
+
+
+def _call_github_sync(prompt: str) -> str:
+    """GitHub Models: FREE for any GitHub user. Needs GITHUB_MODELS_TOKEN (a GitHub
+    fine-grained Personal Access Token with the 'models:read' permission).
+    Model via GITHUB_MODELS_MODEL (default openai/gpt-4o-mini)."""
+    return _call_openai_compatible(
+        prompt,
+        url="https://models.github.ai/inference/chat/completions",
+        key_env="GITHUB_MODELS_TOKEN",
+        model=os.getenv("GITHUB_MODELS_MODEL", "openai/gpt-4o-mini"),
+        label="GitHub",
+    )
+
+
+def _call_mistral_sync(prompt: str) -> str:
+    """Mistral: free tier (~1B tokens/month). Needs MISTRAL_API_KEY (console.mistral.ai).
+    Model via MISTRAL_MODEL (default mistral-small-latest)."""
+    return _call_openai_compatible(
+        prompt,
+        url="https://api.mistral.ai/v1/chat/completions",
+        key_env="MISTRAL_API_KEY",
+        model=os.getenv("MISTRAL_MODEL", "mistral-small-latest"),
+        label="Mistral",
+    )
+
+
+def _call_nvidia_sync(prompt: str) -> str:
+    """NVIDIA NIM: free (40 req/min). Needs NVIDIA_API_KEY (build.nvidia.com).
+    Model via NVIDIA_MODEL (default meta/llama-3.3-70b-instruct)."""
+    return _call_openai_compatible(
+        prompt,
+        url="https://integrate.api.nvidia.com/v1/chat/completions",
+        key_env="NVIDIA_API_KEY",
+        model=os.getenv("NVIDIA_MODEL", "meta/llama-3.3-70b-instruct"),
+        label="NVIDIA",
+    )
+
+
+RETRY_WAIT_SECONDS = 2.0  # pause before one retry when a provider is rate-limited (HTTP 429)
+
+
+def _retry_429(fn):
+    """Wrap a provider call so a single 429 (rate-limit) triggers ONE retry after a
+    short wait. Turns most intermittent throttles into successful responses."""
+    def wrapped(prompt: str) -> str:
+        out = fn(prompt)
+        if isinstance(out, str) and out.startswith("ERR:HTTP429"):
+            time.sleep(RETRY_WAIT_SECONDS)
+            out = fn(prompt)
+        return out
+    wrapped.__name__ = getattr(fn, "__name__", "provider")
+    return wrapped
+
+
 # ── AI PROVIDER REGISTRY ──────────────────────────────────────────────────────
 # This is the ONLY place to edit to add/remove an AI. Each entry is
 # (DisplayName, function(prompt)->str). A provider with no API key set simply
 # returns no tips and is skipped — safe to list before you add its key.
 PROVIDERS = [
-    ("Claude",     _call_claude_sync),
-    ("Gemini",     _call_gemini_sync),
-    ("Groq",       _call_groq_sync),
-    ("DeepSeek",   _call_deepseek_sync),
-    ("OpenAI",     _call_openai_sync),
-    ("OpenRouter", _call_openrouter_sync),
+    ("Claude",     _retry_429(_call_claude_sync)),
+    ("Gemini",     _retry_429(_call_gemini_sync)),
+    ("Groq",       _retry_429(_call_groq_sync)),
+    ("DeepSeek",   _retry_429(_call_deepseek_sync)),
+    ("OpenAI",     _retry_429(_call_openai_sync)),
+    ("OpenRouter", _retry_429(_call_openrouter_sync)),
+    ("Cerebras",   _retry_429(_call_cerebras_sync)),
+    ("GitHub",     _retry_429(_call_github_sync)),
+    ("Mistral",    _retry_429(_call_mistral_sync)),
+    ("NVIDIA",     _retry_429(_call_nvidia_sync)),
 ]
 
 
