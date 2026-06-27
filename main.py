@@ -13,7 +13,7 @@ import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -296,6 +296,17 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
     ai_result  = await ai_analyzer.analyse(fixture_text, today)
     tips       = ai_result["tips"]
     active_ais = ai_result["activeAIs"]
+
+    # ── STEP 3b: Model-driven multi-market tips (more volume, model-priced) ──
+    # Adds strong markets the AI didn't cover on fixtures we have real data for,
+    # so the feed is fuller without ever inventing a statistic.
+    try:
+        from services.ml_service.tip_generator import generate_model_tips
+        before = len(tips)
+        tips = generate_model_tips(tips, rates_map, fixtures, today)
+        logger.info(f"[TipGen] AI tips {before} -> {len(tips)} after model market sweep")
+    except Exception as e:
+        logger.warning(f"[TipGen] model tip generation failed: {e}")
 
     if not tips:
         return {
@@ -710,6 +721,62 @@ async def debug_odds():
 
 
 # ── Run ──────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ADMIN: keep football.db fresh, then download it to commit to GitHub.
+#  Both routes are gated by your INTERNAL_API_KEY (pass ?key=YOUR_KEY).
+#  refresh-db is FREE (pulls new international results from a public CSV; no
+#  API-Football credits used). Workflow: hit refresh-db -> download-db ->
+#  upload the file to GitHub (replacing database/football.db).
+# ─────────────────────────────────────────────────────────────────────────────
+_DB_FILE = os.path.join(os.path.dirname(__file__), "database", "football.db")
+
+
+def _db_freshness():
+    import sqlite3
+    c = sqlite3.connect(_DB_FILE)
+    try:
+        intl = c.execute("SELECT MAX(date), COUNT(*) FROM fixtures "
+                         "WHERE league_id=1 AND home_goals IS NOT NULL").fetchone()
+        allr = c.execute("SELECT MAX(date), COUNT(*) FROM fixtures "
+                         "WHERE home_goals IS NOT NULL").fetchone()
+    finally:
+        c.close()
+    return {
+        "latest_international": intl[0], "international_rows": intl[1],
+        "latest_any_result": allr[0], "total_finished_rows": allr[1],
+    }
+
+
+@app.get("/api/admin/refresh-db")
+async def admin_refresh_db(key: str = ""):
+    """Append newly finished international matches (free). Returns DB freshness."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    try:
+        from services.data_service import live_data
+        result = live_data.refresh_results(force=True)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"refresh failed: {e}")
+    info = _db_freshness()
+    info["refresh"] = result
+    info["next_step"] = ("Download the updated DB at "
+                         "/api/admin/download-db?key=YOUR_KEY then upload it to "
+                         "GitHub, replacing database/football.db, so the change persists.")
+    return info
+
+
+@app.get("/api/admin/download-db")
+async def admin_download_db(key: str = ""):
+    """Stream football.db so you can download it and commit it to GitHub."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    if not os.path.exists(_DB_FILE):
+        raise HTTPException(status_code=404, detail="football.db not found")
+    return FileResponse(_DB_FILE, media_type="application/octet-stream",
+                        filename="football.db")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
