@@ -777,6 +777,63 @@ async def admin_download_db(key: str = ""):
                         filename="football.db")
 
 
+@app.get("/api/ai-check")
+async def ai_check(key: str = ""):
+    """Ping every configured AI in parallel and report which ones actually work.
+    Open in a browser: /api/ai-check?key=YOUR_INTERNAL_API_KEY"""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+
+    from concurrent.futures import ThreadPoolExecutor
+    from services.ml_service.ai_analyzer import PROVIDERS
+
+    test_prompt = ("Connection test. Reply with a JSON array containing exactly one "
+                   "object: [{\"ok\":true}]")
+
+    def classify(name: str, raw: str) -> dict:
+        r = raw or ""
+        if r.startswith("ERR:no_key"):
+            return {"ai": name, "ok": False, "emoji": "⚪",
+                    "status": "no key set", "detail": "Add its API key in Railway Variables to enable it."}
+        if r.startswith("ERR:HTTP401") or r.startswith("ERR:HTTP403"):
+            return {"ai": name, "ok": False, "emoji": "❌",
+                    "status": "key rejected", "detail": "The key is wrong/invalid for this provider. " + r[:140]}
+        if r.startswith("ERR:HTTP429"):
+            return {"ai": name, "ok": True, "emoji": "🟡",
+                    "status": "rate-limited", "detail": "Key works but is being throttled right now."}
+        low = r.lower()
+        if r.startswith("ERR:") and any(p in low for p in
+                ("api key not valid", "invalid", "unauthor", "permission", "api_key")):
+            return {"ai": name, "ok": False, "emoji": "❌",
+                    "status": "key rejected",
+                    "detail": "Wrong/invalid key for this provider (e.g. an OpenAI key won't work for Gemini). " + r[:120]}
+        if r.startswith("ERR:"):
+            return {"ai": name, "ok": False, "emoji": "❌",
+                    "status": "error", "detail": r[:160]}
+        return {"ai": name, "ok": True, "emoji": "✅",
+                "status": "working", "detail": f"Responded ({len(r)} chars)."}
+
+    with ThreadPoolExecutor(max_workers=max(2, len(PROVIDERS))) as ex:
+        futures = {name: ex.submit(fn, test_prompt) for name, fn in PROVIDERS}
+        results = [classify(name, futures[name].result()) for name, _ in PROVIDERS]
+
+    working = [r["ai"] for r in results if r["status"] in ("working", "rate-limited")]
+    summary = "   ".join(f"{r['emoji']} {r['ai']}" for r in results)
+    return {
+        "summary": summary,
+        "working": working,
+        "working_count": len(working),
+        "total_configured": sum(1 for r in results if r["status"] != "no key set"),
+        "providers": results,
+        "legend": {
+            "✅": "working",
+            "🟡": "key works but rate-limited",
+            "❌": "key is set but failing (usually wrong key)",
+            "⚪": "no key set (provider skipped)",
+        },
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
