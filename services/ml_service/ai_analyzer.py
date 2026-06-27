@@ -117,6 +117,97 @@ def _call_groq_sync(prompt: str) -> str:
         return f"ERR:{type(e).__name__}:{e}"
 
 
+def _call_openai_compatible(prompt: str, *, url: str, key_env: str,
+                            model: str, label: str) -> str:
+    """Generic caller for ANY OpenAI-compatible chat API (DeepSeek, OpenRouter, Together, etc.).
+    To add a new model you usually only need a one-line wrapper around this."""
+    key = os.getenv(key_env, "").strip()
+    if not key:
+        print(f"[{label}] No key in env ({key_env})")
+        return "ERR:no_key"
+    try:
+        print(f"[{label}] Calling {model} ...")
+        r = requests.post(
+            url,
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "Football analyst. Return ONLY a JSON array. Start [ end ]. No markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 8000,
+                "temperature": 0.1,
+            },
+            timeout=120,
+        )
+        print(f"[{label}] HTTP {r.status_code}")
+        if r.status_code != 200:
+            print(f"[{label}] Body: {r.text[:300]}")
+            return f"ERR:HTTP{r.status_code}:{r.text[:200]}"
+        d = r.json()
+        text = d.get("choices", [{}])[0].get("message", {}).get("content", "")
+        print(f"[{label}] Got {len(text)} chars")
+        return text
+    except Exception as e:
+        print(f"[{label}] Exception: {type(e).__name__}: {e}")
+        return f"ERR:{type(e).__name__}:{e}"
+
+
+def _call_deepseek_sync(prompt: str) -> str:
+    """DeepSeek, OpenAI-compatible. Needs DEEPSEEK_API_KEY in Railway variables."""
+    return _call_openai_compatible(
+        prompt,
+        url="https://api.deepseek.com/chat/completions",
+        key_env="DEEPSEEK_API_KEY",
+        model="deepseek-v4-flash",   # current V4 (cheap+fast). legacy 'deepseek-chat' retires 2026-07-24
+        label="DeepSeek",
+    )
+
+
+
+def _call_openai_sync(prompt: str) -> str:
+    """OpenAI direct. Needs OPENAI_API_KEY. Model via OPENAI_MODEL (default gpt-4o-mini).
+    For newer GPT-5.x models you may need to set OPENAI_MODEL and note some reject
+    custom temperature; gpt-4o-mini works with these defaults."""
+    return _call_openai_compatible(
+        prompt,
+        url="https://api.openai.com/v1/chat/completions",
+        key_env="OPENAI_API_KEY",
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        label="OpenAI",
+    )
+
+
+def _call_openrouter_sync(prompt: str) -> str:
+    """OpenRouter: ONE key, hundreds of models. Needs OPENROUTER_API_KEY.
+    Choose any model via OPENROUTER_MODEL env var, e.g. 'openai/gpt-4o-mini',
+    'google/gemini-2.5-flash', 'anthropic/claude-sonnet-4', 'deepseek/deepseek-chat',
+    'meta-llama/llama-3.1-70b-instruct', or 'openrouter/auto'."""
+    return _call_openai_compatible(
+        prompt,
+        url="https://openrouter.ai/api/v1/chat/completions",
+        key_env="OPENROUTER_API_KEY",
+        model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+        label="OpenRouter",
+    )
+
+
+# ── AI PROVIDER REGISTRY ──────────────────────────────────────────────────────
+# This is the ONLY place to edit to add/remove an AI. Each entry is
+# (DisplayName, function(prompt)->str). A provider with no API key set simply
+# returns no tips and is skipped — safe to list before you add its key.
+PROVIDERS = [
+    ("Claude",     _call_claude_sync),
+    ("Gemini",     _call_gemini_sync),
+    ("Groq",       _call_groq_sync),
+    ("DeepSeek",   _call_deepseek_sync),
+    ("OpenAI",     _call_openai_sync),
+    ("OpenRouter", _call_openrouter_sync),
+]
+
+
 class AIAnalyzer:
     """Multi-AI football analyzer."""
 
@@ -256,12 +347,10 @@ class AIAnalyzer:
         return tips, f"{ai_name}: {len(tips)} tips"
 
     # ── Merge tips across AIs ────────────────────────────────────
-    def _merge(self, all_tips: List[List[Dict]]) -> List[Dict]:
+    def _merge(self, named_tips: List[Tuple[str, List[Dict]]]) -> List[Dict]:
         merged = {}
-        names = ["Claude", "Gemini", "Groq"]
 
-        for i, tips in enumerate(all_tips):
-            name = names[i]
+        for name, tips in named_tips:
             for t in tips:
                 norm_key = re.sub(r"[^a-z0-9]", "", t["match"].lower())[:20] + \
                            re.sub(r"[^a-z0-9]", "", t["pick"].lower())[:15]
@@ -298,29 +387,25 @@ class AIAnalyzer:
     async def analyse(self, fixture_text: str, date: str) -> Dict:
         prompt = self._build_prompt(fixture_text, date)
 
-        # Run all 3 AIs in parallel using threads (works in async context)
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = {
-                "claude": executor.submit(_call_claude_sync, prompt),
-                "gemini": executor.submit(_call_gemini_sync, prompt),
-                "groq": executor.submit(_call_groq_sync, prompt),
-            }
-            claude_raw = futures["claude"].result()
-            gemini_raw = futures["gemini"].result()
-            groq_raw = futures["groq"].result()
+        # Run every configured AI in parallel. To add a model, edit PROVIDERS
+        # at the top of this file — nothing in this method needs to change.
+        with ThreadPoolExecutor(max_workers=max(2, len(PROVIDERS))) as executor:
+            futures = {name: executor.submit(fn, prompt) for name, fn in PROVIDERS}
+            raws = {name: fut.result() for name, fut in futures.items()}
 
-        c_tips, c_dbg = self._extract_tips(claude_raw, "Claude")
-        g_tips, g_dbg = self._extract_tips(gemini_raw, "Gemini")
-        q_tips, q_dbg = self._extract_tips(groq_raw, "Groq")
+        named_tips: List[Tuple[str, List[Dict]]] = []
+        active: List[str] = []
+        debugs: List[str] = []
+        for name, _fn in PROVIDERS:
+            tips_n, dbg_n = self._extract_tips(raws[name], name)
+            named_tips.append((name, tips_n))
+            debugs.append(dbg_n)
+            if tips_n:
+                active.append(name)
 
-        tips = self._merge([c_tips, g_tips, q_tips])
-        active = []
-        if c_tips: active.append("Claude")
-        if g_tips: active.append("Gemini")
-        if q_tips: active.append("Groq")
-
+        tips = self._merge(named_tips)
         return {
             "tips": tips,
             "activeAIs": active,
-            "debug": f"{c_dbg} | {g_dbg} | {q_dbg}",
+            "debug": " | ".join(debugs),
         }
