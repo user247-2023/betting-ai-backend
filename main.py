@@ -391,6 +391,13 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
         duration_ms = duration_ms,
     )
 
+    # Log predictions for calibration tracking (best-effort, never blocks the response)
+    try:
+        from services.ml_service.calibration import log_predictions
+        log_predictions(tips, today)
+    except Exception as e:
+        logger.warning(f"[Calibration] log failed: {e}")
+
     return {
         "tips":            tips,
         "count":           len(tips),
@@ -758,8 +765,15 @@ async def admin_refresh_db(key: str = ""):
         result = live_data.refresh_results(force=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"refresh failed: {e}")
+    # settle any pending calibration predictions now that new results are in
+    try:
+        from services.ml_service.calibration import settle_pending
+        info_cal = settle_pending()
+    except Exception as e:
+        info_cal = {"error": str(e)}
     info = _db_freshness()
     info["refresh"] = result
+    info["calibration"] = info_cal
     info["next_step"] = ("Download the updated DB at "
                          "/api/admin/download-db?key=YOUR_KEY then upload it to "
                          "GitHub, replacing database/football.db, so the change persists.")
@@ -775,6 +789,50 @@ async def admin_download_db(key: str = ""):
         raise HTTPException(status_code=404, detail="football.db not found")
     return FileResponse(_DB_FILE, media_type="application/octet-stream",
                         filename="football.db")
+
+
+_PARAMS_FILE = os.path.join(os.path.dirname(__file__), "database", "dc_params.json")
+
+
+@app.get("/api/admin/fit-model")
+async def admin_fit_model(key: str = ""):
+    """Fit the Dixon-Coles strength model on the current DB and save dc_params.json.
+    Run this after refresh-db. Then download-params and commit the file to GitHub."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    try:
+        from services.ml_service import dixon_coles_fit as dc
+        info = dc.fit_and_save()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"fit failed: {e}")
+    info["next_step"] = ("Download the model at /api/admin/download-params?key=YOUR_KEY "
+                         "and upload it to GitHub at database/dc_params.json so it persists.")
+    return info
+
+
+@app.get("/api/admin/download-params")
+async def admin_download_params(key: str = ""):
+    """Stream dc_params.json so you can commit it to GitHub (database/dc_params.json)."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    if not os.path.exists(_PARAMS_FILE):
+        raise HTTPException(status_code=404, detail="dc_params.json not found - run /api/admin/fit-model first")
+    return FileResponse(_PARAMS_FILE, media_type="application/json", filename="dc_params.json")
+
+
+@app.get("/api/admin/calibration")
+async def admin_calibration(key: str = ""):
+    """Settle any pending predictions, then report how well calibrated the model is."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    try:
+        from services.ml_service import calibration as cal
+        settle = cal.settle_pending()
+        rep = cal.report()
+        rep["just_settled"] = settle
+        return rep
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"calibration failed: {e}")
 
 
 @app.get("/api/ai-check")
