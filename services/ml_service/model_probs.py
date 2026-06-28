@@ -16,6 +16,7 @@ import math
 from typing import Dict, List, Optional, Tuple
 
 from services.data_service.form_provider import fixture_key
+from services.ml_service import dixon_coles_fit as _dc
 
 # ── Model parameters ─────────────────────────────────────────────────────────
 PRIOR = 1.35        # league-average goals per team (shrinkage target)
@@ -34,7 +35,19 @@ def _shrink(avg: float, n: int) -> float:
 
 
 def expected_goals(r: Dict) -> Tuple[float, float]:
-    """Estimate expected goals (lambda) for home and away from real rates."""
+    """Expected goals for the fixture.
+    Prefers the FITTED Dixon-Coles strength model (real attack/defense ratings);
+    falls back to the simple last-6 shrinkage estimate if the model isn't fitted
+    yet or a team is unknown."""
+    fitted = None
+    try:
+        fitted = _dc.lambdas(r.get("home_team", ""), r.get("away_team", ""),
+                             bool(r.get("neutral")))
+    except Exception:
+        fitted = None
+    if fitted:
+        return fitted
+
     h_gf = _shrink(r["home_gf"], r["home_n"])
     h_ga = _shrink(r["home_ga"], r["home_n"])
     a_gf = _shrink(r["away_gf"], r["away_n"])
@@ -53,7 +66,12 @@ def _pois(k: int, lam: float) -> float:
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
-def score_matrix(lam_h: float, lam_a: float, rho: float = RHO, maxg: int = MAX_GOALS):
+def score_matrix(lam_h: float, lam_a: float, rho: float = None, maxg: int = MAX_GOALS):
+    if rho is None:
+        try:
+            rho = _dc.rho()
+        except Exception:
+            rho = RHO
     """Joint P(home=i, away=j) with Dixon-Coles low-score correction, renormalised."""
     ph = [_pois(i, lam_h) for i in range(maxg + 1)]
     pa = [_pois(j, lam_a) for j in range(maxg + 1)]
