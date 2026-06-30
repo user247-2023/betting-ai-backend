@@ -820,6 +820,60 @@ async def admin_download_params(key: str = ""):
     return FileResponse(_PARAMS_FILE, media_type="application/json", filename="dc_params.json")
 
 
+@app.get("/api/admin/weekly")
+async def admin_weekly(key: str = ""):
+    """Fully automatic weekly maintenance, meant to be hit by a scheduled cron.
+    Chain: refresh international results -> settle calibration -> re-fit the model
+    -> commit football.db + dc_params.json back to GitHub in ONE commit (one redeploy).
+    Guarded by INTERNAL_API_KEY. Each step is best-effort and reported separately so a
+    single failure doesn't hide what did succeed."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+
+    out = {"steps": {}}
+
+    # 1) refresh free international results
+    try:
+        from services.data_service import live_data
+        out["steps"]["refresh"] = live_data.refresh_results(force=True)
+    except Exception as e:
+        out["steps"]["refresh"] = {"error": str(e)}
+
+    # 2) settle pending calibration predictions against the new results
+    try:
+        from services.ml_service.calibration import settle_pending
+        out["steps"]["calibration"] = settle_pending()
+    except Exception as e:
+        out["steps"]["calibration"] = {"error": str(e)}
+
+    # 3) re-fit the Dixon-Coles strength model on the refreshed DB
+    try:
+        from services.ml_service import dixon_coles_fit as dc
+        out["steps"]["fit"] = dc.fit_and_save()
+    except Exception as e:
+        out["steps"]["fit"] = {"error": str(e)}
+
+    # 4) commit BOTH files back to GitHub in a single commit (one redeploy)
+    try:
+        from services.ml_service import github_commit
+        files = {}
+        if os.path.exists(_DB_FILE):     files["database/football.db"]   = _DB_FILE
+        if os.path.exists(_PARAMS_FILE): files["database/dc_params.json"] = _PARAMS_FILE
+        if not files:
+            out["steps"]["commit"] = {"error": "no files to commit"}
+        else:
+            from datetime import datetime
+            msg = f"Weekly auto-refresh {datetime.utcnow().strftime('%Y-%m-%d')}"
+            out["steps"]["commit"] = github_commit.commit_files(files, msg)
+            out["note"] = ("Files committed. Railway will now redeploy once to pick "
+                           "them up; this container may restart shortly.")
+    except Exception as e:
+        out["steps"]["commit"] = {"error": str(e)}
+
+    out["ok"] = all("error" not in v for v in out["steps"].values())
+    return out
+
+
 @app.get("/api/calibration")
 async def public_calibration():
     """Public, read-only model-accuracy report (no key, no settling)."""
