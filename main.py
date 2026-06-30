@@ -792,6 +792,7 @@ async def admin_download_db(key: str = ""):
 
 
 _PARAMS_FILE = os.path.join(os.path.dirname(__file__), "database", "dc_params.json")
+_LASTRUN_FILE = os.path.join(os.path.dirname(__file__), "database", "last_run.json")
 
 
 @app.get("/api/admin/fit-model")
@@ -853,20 +854,33 @@ async def admin_weekly(key: str = ""):
     except Exception as e:
         out["steps"]["fit"] = {"error": str(e)}
 
-    # 4) commit BOTH files back to GitHub in a single commit (one redeploy)
+    # 4) record a last-run marker and commit EVERYTHING in one commit (one redeploy)
     try:
-        from services.ml_service import github_commit
+        import json as _json
+        from datetime import datetime, timedelta
         files = {}
         if os.path.exists(_DB_FILE):     files["database/football.db"]   = _DB_FILE
         if os.path.exists(_PARAMS_FILE): files["database/dc_params.json"] = _PARAMS_FILE
-        if not files:
-            out["steps"]["commit"] = {"error": "no files to commit"}
-        else:
-            from datetime import datetime
-            msg = f"Weekly auto-refresh {datetime.utcnow().strftime('%Y-%m-%d')}"
-            out["steps"]["commit"] = github_commit.commit_files(files, msg)
-            out["note"] = ("Files committed. Railway will now redeploy once to pick "
-                           "them up; this container may restart shortly.")
+        run_at = datetime.utcnow()
+        fit = out["steps"].get("fit") if isinstance(out["steps"].get("fit"), dict) else {}
+        last_run = {
+            "last_run_utc": run_at.isoformat() + "Z",
+            "last_run_eat": (run_at + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M") + " EAT",
+            "refresh": out["steps"].get("refresh"),
+            "calibration": out["steps"].get("calibration"),
+            "fit_matches": fit.get("n_matches"),
+            "fit_teams": fit.get("n_teams"),
+        }
+        with open(_LASTRUN_FILE, "w") as f:
+            _json.dump(last_run, f)
+        files["database/last_run.json"] = _LASTRUN_FILE  # committed too -> survives redeploys
+
+        from services.ml_service import github_commit
+        msg = f"Weekly auto-refresh {run_at.strftime('%Y-%m-%d')}"
+        out["steps"]["commit"] = github_commit.commit_files(files, msg)
+        out["last_run_eat"] = last_run["last_run_eat"]
+        out["note"] = ("Files committed. Railway will now redeploy once to pick "
+                       "them up; this container may restart shortly.")
     except Exception as e:
         out["steps"]["commit"] = {"error": str(e)}
 
@@ -874,14 +888,35 @@ async def admin_weekly(key: str = ""):
     return out
 
 
+@app.get("/api/admin/status")
+async def admin_status(key: str = ""):
+    """Quick check that the weekly cron actually fired: returns the last-run marker."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    try:
+        import json as _json
+        with open(_LASTRUN_FILE) as f:
+            return _json.load(f)
+    except Exception:
+        return {"last_run_utc": None,
+                "message": "The weekly job has not run yet (no last_run.json committed)."}
+
+
 @app.get("/api/calibration")
 async def public_calibration():
     """Public, read-only model-accuracy report (no key, no settling)."""
     try:
         from services.ml_service import calibration as cal
-        return cal.report()
+        rep = cal.report()
     except Exception as e:
-        return {"settled": 0, "error": str(e)}
+        rep = {"settled": 0, "error": str(e)}
+    try:
+        import json as _json
+        with open(_LASTRUN_FILE) as f:
+            rep["last_auto_run"] = _json.load(f).get("last_run_eat")
+    except Exception:
+        pass
+    return rep
 
 
 @app.get("/api/admin/calibration")
