@@ -820,6 +820,16 @@ async def admin_download_params(key: str = ""):
     return FileResponse(_PARAMS_FILE, media_type="application/json", filename="dc_params.json")
 
 
+@app.get("/api/calibration")
+async def public_calibration():
+    """Public, read-only model-accuracy report (no key, no settling)."""
+    try:
+        from services.ml_service import calibration as cal
+        return cal.report()
+    except Exception as e:
+        return {"settled": 0, "error": str(e)}
+
+
 @app.get("/api/admin/calibration")
 async def admin_calibration(key: str = ""):
     """Settle any pending predictions, then report how well calibrated the model is."""
