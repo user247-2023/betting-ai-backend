@@ -53,17 +53,45 @@ class ValueEngine:
             "recommended_stake_pct": round(stake, 2),
         }
 
+    # Edges above this on mainstream markets are data errors, not free money.
+    SUSPECT_EDGE = 0.35
+
     def evaluate_tip(self, tip: Dict) -> Dict:
-        """Add value fields to a tip that already has predicted_probability and bookmaker_odds."""
-        prob = tip.get("predicted_probability", 0.5)
-        odds = tip.get("bookmaker_odds", 1.90)
+        """Add value fields ONLY when a real bookmaker price for this exact
+        market was found. No real odds -> no value claim at all. A fabricated
+        default here once produced fake +60% edges; never again."""
+        prob = tip.get("predicted_probability") or 0
+        odds = tip.get("bookmaker_odds")
+        has_real = bool(tip.get("real_odds_available")) and isinstance(odds, (int, float)) and odds > 1.0
+
+        if not has_real or prob <= 0:
+            # explicitly no value verdict — the UI shows the tip neutrally
+            tip["value"] = None
+            tip["is_value_bet"] = False
+            tip.pop("edge_pct", None)
+            return tip
+
         val = self.calculate(prob, odds)
+
+        # Sanity guard: a huge computed edge means the odds were matched to the
+        # wrong market/line. Refuse to award value and flag it for inspection.
+        if val.get("value") is not None and val["value"] > self.SUSPECT_EDGE:
+            tip["value"] = None
+            tip["is_value_bet"] = False
+            tip["odds_suspect"] = True
+            tip.pop("edge_pct", None)
+            return tip
+
         tip.update(val)
         return tip
 
     def evaluate_batch(self, tips: List[Dict]) -> List[Dict]:
         evaluated = [self.evaluate_tip(t) for t in tips]
-        return sorted(evaluated, key=lambda x: x.get("value", -1), reverse=True)
+        def _key(t):
+            v = t.get("value")
+            has = 1 if isinstance(v, (int, float)) else 0
+            return (has, v if has else 0, t.get("predicted_probability") or 0)
+        return sorted(evaluated, key=_key, reverse=True)
 
     def filter_value_only(self, tips: List[Dict]) -> List[Dict]:
         return [t for t in tips if t.get("is_value_bet", False)]
