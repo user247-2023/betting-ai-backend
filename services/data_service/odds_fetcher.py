@@ -14,6 +14,7 @@ FIXES (v2):
 """
 import os
 import time
+import re
 import requests
 from typing import Dict, List, Optional
 
@@ -250,19 +251,45 @@ class OddsFetcher:
 
         return {}
 
-    # ── Pick → odds resolution ─────────────────────────────────────
-    def get_best_odds(self, pick: str, odds_data: Dict) -> Optional[float]:
+    # ── Pick → odds resolution (STRICT) ────────────────────────────
+    # The feed only carries goal-totals (and optionally BTTS). A price is
+    # attached ONLY when market, line, and side all match exactly. Loose
+    # substring matching here once priced "Brazil To Score" off a totals
+    # line — that class of bug is what this strictness prevents.
+    @staticmethod
+    def _line_key(side: str, line) -> Optional[str]:
+        try:
+            f = float(line)
+        except (TypeError, ValueError):
+            return None
+        pt = str(int(f)) if f == int(f) else str(f)
+        return f"{side.capitalize()} {pt} Goals"
+
+    def get_best_odds(self, tip: Dict, odds_data: Dict) -> Optional[float]:
         if not odds_data:
             return None
-        pick_lower = (pick or "").lower()
-        for market_name, price in odds_data.get("odds", {}).items():
-            if market_name.lower() in pick_lower or pick_lower in market_name.lower():
-                return price
-        # partial token match (e.g. "over" + "2.5")
-        for market_name, price in odds_data.get("odds", {}).items():
-            parts = [p for p in pick_lower.split() if len(p) > 2]
-            if parts and all(p in market_name.lower() for p in parts):
-                return price
+        book = odds_data.get("odds", {})
+        settle = (tip.get("settle_type") or "").lower()
+        side = (tip.get("side") or "").lower()
+        line = tip.get("line")
+        pick = tip.get("pick") or ""
+
+        # 1) structured tips: exact market+line+side only
+        if settle == "goals_ou" and side in ("over", "under"):
+            key = self._line_key(side, line)
+            return book.get(key) if key else None
+        if settle == "btts" and side in ("yes", "no"):
+            return book.get(f"BTTS {side.capitalize()}")
+        if settle:
+            return None   # market not carried by the feed -> no real price
+
+        # 2) unstructured (AI) tips: strict text parse of a totals pick only
+        m = re.match(r"\s*(over|under)\s+(\d+(?:\.\d+)?)", pick.lower())
+        if m:
+            return book.get(self._line_key(m.group(1), m.group(2)))
+        if pick.lower().startswith("btts"):
+            want = "Yes" if "yes" in pick.lower() else "No" if "no" in pick.lower() else None
+            return book.get(f"BTTS {want}") if want else None
         return None
 
     # ── Enrich a batch of tips with real odds ──────────────────────
@@ -279,7 +306,7 @@ class OddsFetcher:
                 tip["real_odds_available"] = False
                 continue
 
-            real_odds = self.get_best_odds(tip.get("pick", ""), odds_data)
+            real_odds = self.get_best_odds(tip, odds_data)
             if real_odds:
                 tip["bookmaker_odds"]      = real_odds
                 tip["real_odds_available"] = True
