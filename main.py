@@ -765,6 +765,13 @@ async def admin_refresh_db(key: str = ""):
         result = live_data.refresh_results(force=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"refresh failed: {e}")
+    # refresh club-league results too (openfootball archives, free)
+    try:
+        from services.data_service.club_ingest import refresh_club_results
+        info_clubs = refresh_club_results()
+    except Exception as e:
+        info_clubs = {"error": str(e)}
+
     # settle any pending calibration predictions now that new results are in
     try:
         from services.ml_service.calibration import settle_pending
@@ -773,6 +780,7 @@ async def admin_refresh_db(key: str = ""):
         info_cal = {"error": str(e)}
     info = _db_freshness()
     info["refresh"] = result
+    info["clubs"] = info_clubs
     info["calibration"] = info_cal
     info["next_step"] = ("Download the updated DB at "
                          "/api/admin/download-db?key=YOUR_KEY then upload it to "
@@ -839,6 +847,13 @@ async def admin_weekly(key: str = ""):
         out["steps"]["refresh"] = live_data.refresh_results(force=True)
     except Exception as e:
         out["steps"]["refresh"] = {"error": str(e)}
+
+    # 1b) refresh club-league results (openfootball archives, free)
+    try:
+        from services.data_service.club_ingest import refresh_club_results
+        out["steps"]["clubs"] = refresh_club_results()
+    except Exception as e:
+        out["steps"]["clubs"] = {"error": str(e)}
 
     # 2) settle pending calibration predictions against the new results
     try:
