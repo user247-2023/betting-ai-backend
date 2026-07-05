@@ -206,3 +206,72 @@ def report(db_path=_DB_PATH) -> Dict:
         "guide": "Good calibration = 'actual_hit' close to 'predicted' in each band "
                  "(small gap). Brier < 0.25 is decent; lower is better.",
     }
+
+
+# ─────────────────────────── calibration correction ─────────────────────────
+# Learns a Platt-style correction from SETTLED predictions: if the model runs
+# over/under-confident, future probabilities are nudged toward reality.
+# Research-standard approach (a calibration layer measurably improves
+# reliability and profitability). Guards: needs >= MIN_SETTLED settled rows,
+# coefficients are clamped, and it silently no-ops on any problem.
+
+MIN_SETTLED = 150
+_CORR_CACHE = {"at": None, "ab": None}   # fitted (a, b), cached per process
+_CORR_TTL_S = 3600
+
+
+def _logit(p):
+    import math
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return math.log(p / (1 - p))
+
+
+def fit_correction(db_path=_DB_PATH):
+    """Fit p' = sigmoid(a + b*logit(p)) on settled predictions. Returns (a, b)
+    or None if there isn't enough data. Cached for an hour."""
+    import math, time
+    now = time.time()
+    if _CORR_CACHE["at"] and now - _CORR_CACHE["at"] < _CORR_TTL_S:
+        return _CORR_CACHE["ab"]
+    ab = None
+    try:
+        with _conn(db_path) as c:
+            rows = c.execute("SELECT predicted_probability p, outcome o FROM calibration "
+                             "WHERE outcome IS NOT NULL").fetchall()
+        if len(rows) >= MIN_SETTLED:
+            xs = [_logit(r["p"]) for r in rows]
+            ys = [float(r["o"]) for r in rows]
+            a, b = 0.0, 1.0
+            lr = 0.05
+            for _ in range(400):          # tiny logistic regression, 2 params
+                ga = gb = 0.0
+                for x, y in zip(xs, ys):
+                    z = a + b * x
+                    pr = 1.0 / (1.0 + math.exp(-max(min(z, 30), -30)))
+                    ga += (pr - y)
+                    gb += (pr - y) * x
+                a -= lr * ga / len(xs)
+                b -= lr * gb / len(xs)
+            # clamp: correction may nudge, never distort
+            a = max(min(a, 0.75), -0.75)
+            b = max(min(b, 1.6), 0.6)
+            ab = (a, b)
+    except Exception:
+        ab = None
+    _CORR_CACHE["at"] = now
+    _CORR_CACHE["ab"] = ab
+    return ab
+
+
+def apply_correction(p, db_path=_DB_PATH):
+    """Corrected probability, or p unchanged if no correction is fitted."""
+    import math
+    try:
+        ab = fit_correction(db_path)
+        if not ab or p is None:
+            return p
+        a, b = ab
+        z = a + b * _logit(float(p))
+        return 1.0 / (1.0 + math.exp(-max(min(z, 30), -30)))
+    except Exception:
+        return p

@@ -23,11 +23,15 @@ from services.ml_service.model_probs import (
 )
 
 # Quality gate: only surface markets the model rates at/above this probability.
-THRESHOLD = 0.62
+# Env-tunable: TIP_THRESHOLD (default 0.55 — was 0.62; the calibration tracker
+# grades every band, so mid-probability tips are measured, not guessed).
+THRESHOLD = float(os.getenv("TIP_THRESHOLD", "0.55"))
 # Don't flood one match — keep its strongest N markets.
-MAX_PER_FIXTURE = 4
+MAX_PER_FIXTURE = int(os.getenv("TIP_MAX_PER_FIXTURE", "6"))
 # Hard ceiling on model tips added per slate.
-MAX_TOTAL = 40
+MAX_TOTAL = int(os.getenv("TIP_MAX_TOTAL", "60"))
+# Data-sufficiency guard: never tip a fixture we can't ground (junk protection).
+MIN_FORM_MATCHES = 3
 
 
 def _norm(s: str) -> str:
@@ -63,6 +67,9 @@ def _candidates(m, home: str, away: str) -> List[tuple]:
         (p_away_clean(m), "Clean Sheet", f"{away} Clean Sheet", "clean_sheet", None, "away"),
         (p_home_atleast(m, 2), "Team Goals", f"{home} Over 1.5 Goals", "team_goals", 1.5, "over"),
         (p_away_atleast(m, 2), "Team Goals", f"{away} Over 1.5 Goals", "team_goals", 1.5, "over"),
+        (p_home_atleast(m, 1), "Team To Score", f"{home} To Score", "team_goals", 0.5, "over"),
+        (p_away_atleast(m, 1), "Team To Score", f"{away} To Score", "team_goals", 0.5, "over"),
+        (o35, "Over/Under 3.5 Goals", "Over 3.5 Goals", "goals_ou", 3.5, "over"),
         (1 - odd, "Odd/Even Goals", "Even Total Goals", "odd_even", None, "even"),
     ]
 
@@ -122,6 +129,20 @@ def generate_model_tips(existing_tips: List[Dict], rates_map: Dict[str, Dict],
             continue
         home, away = fx.get("home", ""), fx.get("away", "")
         match = f"{home} vs {away}"
+
+        # Junk protection: tip only if the fitted model knows BOTH teams, or we
+        # have at least MIN_FORM_MATCHES of real recent form for both. Fixtures
+        # with no grounding produce prior-only probabilities — skip them.
+        try:
+            from services.ml_service import dixon_coles_fit as _dc
+            fitted_ok = _dc.lambdas(home, away, bool(rates.get("neutral"))) is not None
+        except Exception:
+            fitted_ok = False
+        form_ok = (rates.get("home_n", 0) >= MIN_FORM_MATCHES
+                   and rates.get("away_n", 0) >= MIN_FORM_MATCHES)
+        if not (fitted_ok or form_ok):
+            continue
+
         try:
             lam_h, lam_a = expected_goals(rates)
             m = score_matrix(lam_h, lam_a)

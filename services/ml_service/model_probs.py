@@ -278,6 +278,18 @@ def enrich(tips: List[Dict], rates_map: Dict[str, Dict]) -> List[Dict]:
 
         t["ai_probability"] = t.get("predicted_probability")
         t["model_probability"] = round(p, 4)
+
+        # Calibration-aware correction: once enough predictions are settled,
+        # probabilities are adjusted toward observed reality (no-op until then).
+        try:
+            from services.ml_service.calibration import apply_correction
+            p_adj = apply_correction(p)
+        except Exception:
+            p_adj = p
+        if p_adj is not None and abs(p_adj - p) > 1e-9:
+            t["calibrated"] = True
+        p = p_adj if p_adj is not None else p
+
         t["predicted_probability"] = round(p, 4)
         t["fair_odds"] = round(1.0 / p, 2) if p > 0.01 else 50.0
         t["prob_source"] = "model"

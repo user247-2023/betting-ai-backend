@@ -33,7 +33,7 @@ _PARAMS_PATH = os.path.join(_DIR, "..", "..", "database", "dc_params.json")
 # fitting knobs
 WINDOW_DAYS = 730      # only learn from the last ~2 years
 MIN_MATCHES = 4        # teams with fewer games are dropped (fall back to shrinkage)
-HALF_LIFE_DAYS = 365   # a match 1 year old counts half as much
+HALF_LIFE_DAYS = int(os.getenv("DC_HALF_LIFE_DAYS", "365"))  # tune via env; 365 = 1yr-old match counts half
 RIDGE = 0.05           # L2 on ratings (stability + soft identifiability)
 RHO_GRID = np.linspace(-0.20, 0.02, 23)
 LAM_CLIP = (0.18, 4.6)
