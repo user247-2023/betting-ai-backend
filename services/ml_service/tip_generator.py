@@ -32,6 +32,21 @@ MAX_PER_FIXTURE = int(os.getenv("TIP_MAX_PER_FIXTURE", "6"))
 MAX_TOTAL = int(os.getenv("TIP_MAX_TOTAL", "60"))
 # Data-sufficiency guard: never tip a fixture we can't ground (junk protection).
 MIN_FORM_MATCHES = 3
+# Near-certainties (Over 0.5 at ~97%) carry odds near 1.02 — no betting value and
+# they crowd out real picks. Anything above this ceiling is dropped.
+MAX_PROB = float(os.getenv("TIP_MAX_PROB", "0.92"))
+
+
+# One tip per market FAMILY per fixture. Without this the sweep emits several
+# lines off the same market (Over 0.5 AND Under 4.5 AND Over 1.5...), which look
+# contradictory to a user and can never sensibly share a slip.
+def _family(settle: str, pick: str, home: str, away: str) -> str:
+    if settle in ("team_goals", "clean_sheet", "win_to_nil"):
+        who = "home" if home.lower() in (pick or "").lower() else "away"
+        return f"{settle}:{who}"
+    if settle in ("result", "double_chance", "dnb"):
+        return "result"            # 1X2 / DC / DNB all price the same question
+    return settle or "other"
 
 
 def _norm(s: str) -> str:
@@ -152,15 +167,20 @@ def generate_model_tips(existing_tips: List[Dict], rates_map: Dict[str, Dict],
 
         cands.sort(key=lambda c: c[0], reverse=True)
         picked = 0
+        fam_used = set()
         for prob, market, pick, settle, line, side in cands:
             if picked >= max_per_fixture or len(added) >= MAX_TOTAL:
                 break
-            if prob < threshold:
+            if prob < threshold or prob > MAX_PROB:
                 continue
+            fam = _family(settle, pick, home, away)
+            if fam in fam_used:
+                continue          # never two picks off the same market family
             dk = _dedupe_key(match, settle, side, line)
             if dk in seen:
                 continue
             seen.add(dk)
+            fam_used.add(fam)
             prob = min(prob, 0.95)
             reasoning, key_stats = _reason(home, away, lam_h, lam_a, rates, pick, prob)
             added.append({
