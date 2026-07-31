@@ -297,6 +297,17 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
     tips       = ai_result["tips"]
     active_ais = ai_result["activeAIs"]
 
+    # STEP 3a: reject AI tips that don't match a real fixture and strip stats
+    # the database can't support (invented xG, injuries, referee claims).
+    try:
+        before = len(tips)
+        tips = ai_analyzer.AIAnalyzer.validate_tips(tips, fixtures) \
+            if hasattr(ai_analyzer, "AIAnalyzer") else ai_analyzer.validate_tips(tips, fixtures)
+        if len(tips) != before:
+            logger.info(f"[Validate] dropped {before-len(tips)} invalid AI tips")
+    except Exception as e:
+        logger.warning(f"[Validate] skipped: {e}")
+
     # ── STEP 3b: Model-driven multi-market tips (more volume, model-priced) ──
     # Adds strong markets the AI didn't cover on fixtures we have real data for,
     # so the feed is fuller without ever inventing a statistic.
@@ -390,6 +401,13 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
         ml_used     = ml_enriched,
         duration_ms = duration_ms,
     )
+
+    # ── STEP 8: Grounded deep analysis for every tip ─────────────
+    try:
+        from services.ml_service.analysis_builder import attach as _attach_analysis
+        tips = _attach_analysis(tips, fixtures, today)
+    except Exception as e:
+        logger.warning(f"[Analysis] skipped: {e}")
 
     # Log predictions for calibration tracking (best-effort, never blocks the response)
     try:
