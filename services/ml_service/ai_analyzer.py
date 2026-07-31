@@ -303,10 +303,13 @@ class AIAnalyzer:
             "================ ALLOWED MARKETS (all derivable from goals) ================\n"
             "Match Result (Home/Draw/Away) | Double Chance (1X/12/X2) | Draw No Bet | "
             "Over/Under 1.5/2.5/3.5 Goals | BTTS Yes/No | Win to Nil | Clean Sheet (Home/Away) | "
-            "Odd/Even Total Goals | Team Over/Under 1.5 Goals | Correct Score (only when very strong).\n"
+            "Odd/Even Total Goals | Team Over/Under 1.5 Goals.\n"
             "FORBIDDEN - never tip these (we have no data, tipping them = fabrication): corners, "
             "cards, shots, fouls, throw-ins, offsides, possession, 1st/2nd half markets, HT/FT, "
-            "player props, goalscorers, Asian handicaps.\n\n"
+            "player props, goalscorers, Asian handicaps.\n"
+            "ALSO FORBIDDEN - Correct Score and any exact-scoreline market. These are lottery bets "
+            "(typical odds 5.0+ means under a 20% chance). They cannot be priced honestly by our "
+            "model and have no place in a rollover strategy that needs high-probability legs.\n\n"
             "================ FIXTURE DATA ================\n"
             f"{fixture_text}\n\n"
             "================ OUTPUT ================\n"
@@ -455,6 +458,75 @@ class AIAnalyzer:
         ))
 
     # ── Main analysis - runs all 3 AIs in parallel via threads ───
+    @staticmethod
+    def validate_tips(tips, fixtures):
+        """Drop AI tips that don't belong to a real fixture, and strip stats the
+        database cannot support.
+
+        Two real failures this prevents:
+          * a pick naming a team that isn't in that match (a 'Draw/Huracan' tip
+            attached to Talleres vs Velez),
+          * fabricated advanced metrics ('Rangers away xG: 2.1') — the xG,
+            shots, possession, corners and cards columns are all NULL in our
+            database, so any such number is invented.
+        """
+        import re as _re
+        UNSUPPORTED = _re.compile(
+            r"\b(xg|xga|expected goals|possession|shots?|corners?|cards?|"
+            r"fouls?|offsides?|injur|lineup|line-up|referee|weather)\b", _re.I)
+
+        # Markets we can price, settle and calibrate. Anything else (correct
+        # score, HT/FT, goalscorer) is a lottery market: our model gives it no
+        # honest probability and the calibration tracker cannot grade it, so it
+        # has no place in a rollover strategy that needs high-probability legs.
+        ALLOWED_SETTLE = {"goals_ou", "btts", "result", "double_chance", "dnb",
+                          "win_to_nil", "clean_sheet", "odd_even", "team_goals"}
+        LOTTERY = _re.compile(
+            r"(correct\s*score|ht/?ft|half\s*time/?full\s*time|score\s*cast|"
+            r"scorer|exact\s*goals|score\s*in\s*both)", _re.I)
+
+        by_match = {}
+        for f in fixtures or []:
+            h, a = (f.get("home") or "").strip(), (f.get("away") or "").strip()
+            if h and a:
+                by_match[f"{h} vs {a}".lower()] = (h, a)
+
+        out = []
+        for t in tips or []:
+            # reject lottery markets outright
+            st = (t.get("settle_type") or "").strip().lower()
+            blob = f"{t.get('market','')} {t.get('pick','')}"
+            if LOTTERY.search(blob) or (st and st not in ALLOWED_SETTLE):
+                continue
+
+            match = (t.get("match") or "").strip()
+            teams = by_match.get(match.lower())
+            if by_match and not teams:
+                continue                      # tip references no real fixture
+            if teams:
+                h, a = teams
+                pick = (t.get("pick") or "")
+                # if the pick names a club, it must be one of THIS match's teams
+                for other in by_match.values():
+                    for nm in other:
+                        if nm in (h, a):
+                            continue
+                        if len(nm) > 4 and nm.lower() in pick.lower():
+                            pick = None
+                            break
+                    if pick is None:
+                        break
+                if pick is None:
+                    continue
+                t["home_team"], t["away_team"] = h, a
+
+            stats = [s for s in (t.get("key_stats") or [])
+                     if not (UNSUPPORTED.search(str(s)) and _re.search(r"\d", str(s)))]
+            t["key_stats"] = stats
+            t["ai_unverified"] = True         # AI prose is commentary, not data
+            out.append(t)
+        return out
+
     async def analyse(self, fixture_text: str, date: str) -> Dict:
         prompt = self._build_prompt(fixture_text, date)
 
