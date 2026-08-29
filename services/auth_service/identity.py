@@ -31,9 +31,16 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
-import jwt
 import requests
-from jwt import PyJWKClient
+
+# PyJWT + cryptography power token verification. If they are unavailable the
+# app must still boot and serve everything else — only account features degrade.
+try:
+    import jwt
+    _CRYPTO_OK = True
+except Exception:  # pragma: no cover
+    jwt = None
+    _CRYPTO_OK = False
 
 _CERT_URL = ("https://www.googleapis.com/robot/v1/metadata/x509/"
              "securetoken@system.gserviceaccount.com")
@@ -55,7 +62,8 @@ def _private_key() -> str:
 
 
 def configured() -> bool:
-    return bool(project_id() and os.getenv("FIREBASE_CLIENT_EMAIL") and _private_key())
+    return bool(_CRYPTO_OK and project_id()
+                and os.getenv("FIREBASE_CLIENT_EMAIL") and _private_key())
 
 
 # ───────────────────── Firebase ID token verification ────────────────────
@@ -77,7 +85,7 @@ def verify_id_token(id_token: str) -> Optional[Dict]:
     expiry. A forged or expired token fails here — the uid is never taken on
     trust from the client.
     """
-    if not id_token or not project_id():
+    if not id_token or not project_id() or not _CRYPTO_OK:
         return None
     try:
         from cryptography.x509 import load_pem_x509_certificate
@@ -108,7 +116,7 @@ def _access_token() -> Optional[str]:
     if _sa_token["token"] and now < _sa_token["at"] - 60:
         return _sa_token["token"]
     email, key = os.getenv("FIREBASE_CLIENT_EMAIL", "").strip(), _private_key()
-    if not (email and key):
+    if not (email and key and _CRYPTO_OK):
         return None
     iat = int(now)
     assertion = jwt.encode(
