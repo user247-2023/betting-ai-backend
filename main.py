@@ -1016,6 +1016,48 @@ def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _admin_claims(request: Request):
+    """Return the Firebase claims if the caller is a signed-in admin.
+
+    Admins are listed by email in the ADMIN_EMAILS env var (comma separated).
+    This is safer than shipping the master INTERNAL_API_KEY to a browser: the
+    key can do everything, whereas an admin session can be revoked by simply
+    removing the address from the list.
+    """
+    bearer = request.headers.get("Authorization", "")
+    token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+    if not token:
+        return None
+    from services.auth_service import identity
+    claims = identity.verify_id_token(token)
+    if not claims:
+        return None
+    allowed = [e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()]
+    email = (claims.get("email") or "").lower()
+    if email and email in allowed:
+        return claims
+    return None
+
+
+def _require_admin(request: Request, key: str = ""):
+    """Allow either the master key (server-to-server, cron) or an admin login."""
+    if INTERNAL_API_KEY and key and key == INTERNAL_API_KEY:
+        return {"via": "key"}
+    claims = _admin_claims(request)
+    if claims:
+        return {"via": "account", "email": claims.get("email"), "uid": claims["sub"]}
+    raise HTTPException(status_code=401, detail="Admin access required")
+
+
+@app.get("/api/admin/me")
+async def admin_me(request: Request):
+    """Tells the app whether the signed-in user is an admin."""
+    claims = _admin_claims(request)
+    return {"is_admin": bool(claims),
+            "email": (claims or {}).get("email"),
+            "configured": bool(os.getenv("ADMIN_EMAILS", "").strip())}
+
+
 @app.get("/api/curated")
 async def api_curated(request: Request, tier: str = "1.20", date: str = ""):
     """Subscriber-only: the admin's uploaded tips for this rollover tier."""
@@ -1046,9 +1088,8 @@ async def api_curated(request: Request, tier: str = "1.20", date: str = ""):
 
 
 @app.get("/api/admin/curated/list")
-async def admin_curated_list(key: str = "", tier: str = "1.20", date: str = ""):
-    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
-        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+async def admin_curated_list(request: Request, key: str = "", tier: str = "1.20", date: str = ""):
+    _require_admin(request, key)
     from services.data_service import content
     d = date or _today_str()
     out = {}
@@ -1058,9 +1099,8 @@ async def admin_curated_list(key: str = "", tier: str = "1.20", date: str = ""):
 
 
 @app.post("/api/admin/curated/add")
-async def admin_curated_add(tip: CuratedTip, key: str = ""):
-    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
-        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+async def admin_curated_add(request: Request, tip: CuratedTip, key: str = ""):
+    _require_admin(request, key)
     from services.data_service import content
     d = tip.date or _today_str()
     t = content.normalise_tier(tip.tier)
@@ -1072,11 +1112,10 @@ async def admin_curated_add(tip: CuratedTip, key: str = ""):
 
 
 @app.get("/api/admin/curated/settle")
-async def admin_curated_settle(key: str = "", tier: str = "1.20", date: str = "",
-                               id: str = "", status: str = "WON", all: int = 0):
+async def admin_curated_settle(request: Request, key: str = "", tier: str = "1.20",
+                               date: str = "", id: str = "", status: str = "WON", all: int = 0):
     """Mark one tip - or every pending tip - Won / Lost / Void."""
-    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
-        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    _require_admin(request, key)
     from services.data_service import content
     d = date or _today_str()
     t = content.normalise_tier(tier)
@@ -1091,9 +1130,9 @@ async def admin_curated_settle(key: str = "", tier: str = "1.20", date: str = ""
 
 
 @app.get("/api/admin/curated/delete")
-async def admin_curated_delete(key: str = "", tier: str = "1.20", date: str = "", id: str = ""):
-    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
-        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+async def admin_curated_delete(request: Request, key: str = "", tier: str = "1.20",
+                               date: str = "", id: str = ""):
+    _require_admin(request, key)
     from services.data_service import content
     d = date or _today_str()
     return {"deleted": content.delete_curated(d, content.normalise_tier(tier), id)}
