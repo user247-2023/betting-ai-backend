@@ -14,5 +14,5 @@ apscheduler==3.10.4
 aiosqlite==0.20.0
 redis==5.0.8
 slowapi==0.1.9
-PyJWT==2.9.0
-cryptography==43.0.1
+PyJWT>=2.8.0
+cryptography>=42.0.0
