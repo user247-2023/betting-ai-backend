@@ -245,9 +245,7 @@ class BankrollUpdate(BaseModel):
 #  Full pipeline: Fixtures -> AI Analysis -> Probability -> Value ->
 #                 Rollover Filter -> Strategy Decision
 # ══════════════════════════════════════════════════════════════════
-@app.post("/api/tips")
-@limiter.limit("10/minute;50/hour")
-async def _require_subscription(request: Request, req: "TipsRequest"):
+async def _require_subscription(request: Request, req: TipsRequest):
     """Server-side paywall for the tips feed.
 
     The React app is public JavaScript, so any gate there can be bypassed; this
@@ -304,6 +302,8 @@ async def _require_subscription(request: Request, req: "TipsRequest"):
     raise HTTPException(status_code=402, detail={"error": reason, "message": msg})
 
 
+@app.post("/api/tips")
+@limiter.limit("10/minute;50/hour")
 async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(verify_api_key)):
     # FREE TIER: the AI/model pipeline runs once per day; everyone that day gets
     # the same cached batch. Without this every tap would spend AI tokens again.
