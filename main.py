@@ -8,6 +8,7 @@ Upgraded with:
   - Request validation — Pydantic input sanitization
   - Backtesting engine — strategy validation
 """
+import json
 import os
 import time
 from contextlib import asynccontextmanager
@@ -223,6 +224,9 @@ strategy_engine = StrategyEngine()
 # ── Request Models ───────────────────────────────────────────────
 class TipsRequest(BaseModel):
     date: Optional[str] = None  # YYYY-MM-DD, defaults to today
+    access: Optional[str] = None   # subscriber access code
+    device: Optional[str] = None   # device id, for the per-code device limit
+    refresh: Optional[bool] = False  # admin: bypass the daily cache
 
 class BetResult(BaseModel):
     result: str  # "WIN" or "LOSS"
@@ -243,7 +247,73 @@ class BankrollUpdate(BaseModel):
 # ══════════════════════════════════════════════════════════════════
 @app.post("/api/tips")
 @limiter.limit("10/minute;50/hour")
+async def _require_subscription(request: Request, req: "TipsRequest"):
+    """Server-side paywall for the tips feed.
+
+    The React app is public JavaScript, so any gate there can be bypassed; this
+    check is the real one. Set SUBSCRIPTIONS_ENABLED=0 in Railway to disable.
+    """
+    if os.getenv("SUBSCRIPTIONS_ENABLED", "1") not in ("1", "true", "True"):
+        return {"ok": True, "label": "gate_disabled"}
+
+    code = (req.access or request.headers.get("X-Access-Code", "")
+            or request.query_params.get("access", "")).strip()
+    device = (req.device or request.headers.get("X-Device-Id", "")
+              or request.query_params.get("device", "")).strip()[:64]
+
+    # the owner's internal key always works, so you are never locked out
+    if INTERNAL_API_KEY and code and code == INTERNAL_API_KEY:
+        return {"ok": True, "label": "owner", "owner": True}
+
+    # (a) signed-in account with an active subscription
+    bearer = request.headers.get("Authorization", "")
+    token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+    if token:
+        from services.auth_service import identity
+        claims = identity.verify_id_token(token)
+        if claims:
+            uid = claims["sub"]
+            identity.upsert_user(uid, claims)
+            sub_state = identity.get_subscription(uid)
+            if sub_state.get("active"):
+                return {"ok": True, "uid": uid, "label": "subscriber",
+                        "expires": sub_state.get("expires")}
+            raise HTTPException(status_code=402, detail={
+                "error": sub_state.get("reason", "none"),
+                "message": ("Your subscription has expired. Renew to keep getting tips."
+                            if sub_state.get("reason") == "expired"
+                            else "Subscribe to unlock tips."),
+                "uid": uid})
+        raise HTTPException(status_code=401, detail={
+            "error": "bad_token", "message": "Please sign in again."})
+
+    # (b) legacy access code (still handy for comping friends)
+    from services.data_service import subscriptions
+    res = subscriptions.validate(code, device)
+    if res.get("ok"):
+        return res
+
+    reason = res.get("reason", "invalid")
+    msg = {
+        "no_code":      "A subscription is required to get tips. Enter your access code.",
+        "invalid":      "That access code isn't valid.",
+        "expired":      "Your subscription has expired. Renew to keep getting tips.",
+        "revoked":      "This access code has been revoked.",
+        "device_limit": f"This code is already in use on {res.get('max_devices')} devices.",
+    }.get(reason, "A valid subscription is required.")
+    raise HTTPException(status_code=402, detail={"error": reason, "message": msg})
+
+
 async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(verify_api_key)):
+    # FREE TIER: the AI/model pipeline runs once per day; everyone that day gets
+    # the same cached batch. Without this every tap would spend AI tokens again.
+    from services.data_service import content as _content
+    _today = req.date or datetime.utcnow().strftime("%Y-%m-%d")
+    if not req.refresh:
+        _cached = _content.get_daily(_today)
+        if _cached and _cached.get("tips") is not None:
+            _cached["fromCache"] = True
+            return _cached
     """
     Main tips endpoint — full ML + AI pipeline.
     Rate limited: 10 requests/minute, 50/hour per IP.
@@ -408,6 +478,15 @@ async def get_tips(request: Request, req: TipsRequest, auth: bool = Depends(veri
         tips = _attach_analysis(tips, fixtures, today)
     except Exception as e:
         logger.warning(f"[Analysis] skipped: {e}")
+
+    # Cache today's batch so later taps cost nothing
+    try:
+        _content.save_daily(today, {
+            "tips": tips, "count": len(tips), "date": today,
+            "fixturesFound": len(fixtures), "activeAIs": active_ais,
+        })
+    except Exception as e:
+        logger.warning(f"[Cache] save failed: {e}")
 
     # Log predictions for calibration tracking (best-effort, never blocks the response)
     try:
@@ -919,6 +998,318 @@ async def admin_weekly(key: str = ""):
 
     out["ok"] = all("error" not in v for v in out["steps"].values())
     return out
+
+
+class CuratedTip(BaseModel):
+    date: Optional[str] = None
+    tier: str = "1.20"
+    match: str
+    league: Optional[str] = ""
+    market: Optional[str] = ""
+    pick: str
+    odds: Optional[float] = None
+    kickoff: Optional[str] = ""
+    note: Optional[str] = ""
+
+
+def _today_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+@app.get("/api/curated")
+async def api_curated(request: Request, tier: str = "1.20", date: str = ""):
+    """Subscriber-only: the admin's uploaded tips for this rollover tier."""
+    from services.data_service import content
+    from services.auth_service import identity
+
+    bearer = request.headers.get("Authorization", "")
+    token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+    claims = identity.verify_id_token(token) if token else None
+
+    allowed = False
+    if claims:
+        allowed = bool(identity.get_subscription(claims["sub"]).get("active"))
+    code = request.headers.get("X-Access-Code", "")
+    if not allowed and code:
+        if INTERNAL_API_KEY and code == INTERNAL_API_KEY:
+            allowed = True
+        else:
+            from services.data_service import subscriptions
+            allowed = bool(subscriptions.validate(code, "").get("ok"))
+    if not allowed:
+        raise HTTPException(status_code=402, detail={
+            "error": "subscription_required",
+            "message": "Subscribe to see the daily rollover tips."})
+
+    d = date or _today_str()
+    return content.get_curated(d, content.normalise_tier(tier))
+
+
+@app.get("/api/admin/curated/list")
+async def admin_curated_list(key: str = "", tier: str = "1.20", date: str = ""):
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import content
+    d = date or _today_str()
+    out = {}
+    for t in (content.TIERS if tier == "all" else [content.normalise_tier(tier)]):
+        out[t] = content.get_curated(d, t)
+    return {"date": d, "tiers": out}
+
+
+@app.post("/api/admin/curated/add")
+async def admin_curated_add(tip: CuratedTip, key: str = ""):
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import content
+    d = tip.date or _today_str()
+    t = content.normalise_tier(tip.tier)
+    try:
+        rec = content.add_curated(d, t, tip.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"added": rec, "date": d, "tier": t}
+
+
+@app.get("/api/admin/curated/settle")
+async def admin_curated_settle(key: str = "", tier: str = "1.20", date: str = "",
+                               id: str = "", status: str = "WON", all: int = 0):
+    """Mark one tip - or every pending tip - Won / Lost / Void."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import content
+    d = date or _today_str()
+    t = content.normalise_tier(tier)
+    try:
+        if all:
+            return {"settled": content.settle_all(d, t, status), "date": d, "tier": t}
+        if not id:
+            raise HTTPException(status_code=400, detail="id required (or all=1)")
+        return {"ok": content.settle_curated(d, t, id, status), "date": d, "tier": t}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/admin/curated/delete")
+async def admin_curated_delete(key: str = "", tier: str = "1.20", date: str = "", id: str = ""):
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import content
+    d = date or _today_str()
+    return {"deleted": content.delete_curated(d, content.normalise_tier(tier), id)}
+
+
+@app.get("/api/admin/preload-tips")
+async def admin_preload_tips(request: Request, key: str = "", date: str = "", tz: int = 3):
+    """Generate tomorrow's/today's free tips ONCE and cache them.
+
+    Meant to be hit by a scheduled cron just after midnight. Every free user
+    that day then receives this identical cached batch, so the AI models are
+    called once per day instead of once per user.
+
+    TIMEZONE: the server runs on UTC but the app sends the user's LOCAL date.
+    At 00:05 in Tanzania (EAT, UTC+3) the server clock still reads the previous
+    day, so a naive preload would cache under the wrong key and every user
+    would miss the cache. `tz` (default 3 = EAT) makes the date match what the
+    app will ask for.
+    """
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+
+    from datetime import timedelta as _td
+    from services.data_service import content
+    target = date or (datetime.utcnow() + _td(hours=tz)).strftime("%Y-%m-%d")
+
+    content.clear_daily(target)
+    try:
+        result = await get_tips(request=request,
+                                req=TipsRequest(date=target, refresh=True),
+                                auth=True)
+    except Exception as e:
+        logger.warning(f"[Preload] failed: {e}")
+        raise HTTPException(status_code=500, detail=f"preload failed: {e}")
+
+    tips = result.get("tips", []) if isinstance(result, dict) else []
+    return {"preloaded_for": target, "timezone_offset": tz,
+            "tips_cached": len(tips),
+            "fixtures": result.get("fixturesFound") if isinstance(result, dict) else None,
+            "activeAIs": result.get("activeAIs") if isinstance(result, dict) else None,
+            "note": "Free users now receive this cached batch all day."}
+
+
+@app.get("/api/admin/cache/clear")
+async def admin_cache_clear(key: str = "", date: str = ""):
+    """Force the free daily tips to regenerate on the next request."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import content
+    d = date or _today_str()
+    content.clear_daily(d)
+    return {"cleared": d}
+
+
+@app.get("/api/curated/record")
+async def api_curated_record(tier: str = "1.20", days: int = 14):
+    """Public honest track record for a tier over the last N days."""
+    from services.data_service import content
+    from datetime import timedelta as _td
+    base = datetime.now()
+    dates = [(base - _td(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    return content.curated_record(content.normalise_tier(tier), dates)
+
+
+@app.get("/api/plans")
+async def api_plans():
+    """Public: what a subscription costs."""
+    from services.payment_service.gateway import plans_public
+    return {"plans": plans_public(), "currency": "TZS"}
+
+
+async def _uid_from_request(request: Request) -> str:
+    bearer = request.headers.get("Authorization", "")
+    token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+    from services.auth_service import identity
+    claims = identity.verify_id_token(token) if token else None
+    if not claims:
+        raise HTTPException(status_code=401, detail="Sign in required")
+    identity.upsert_user(claims["sub"], claims)
+    return claims["sub"]
+
+
+@app.get("/api/me")
+async def api_me(request: Request):
+    """Current user's subscription state — drives the paywall in the app."""
+    from services.auth_service import identity
+    uid = await _uid_from_request(request)
+    return {"uid": uid, "subscription": identity.get_subscription(uid)}
+
+
+class PayRequest(BaseModel):
+    plan: str
+    phone: str
+
+
+@app.post("/api/pay/initiate")
+@limiter.limit("6/minute;30/hour")
+async def api_pay_initiate(request: Request, req: PayRequest):
+    """Start a mobile-money payment for the signed-in user."""
+    from services.payment_service import gateway
+    uid = await _uid_from_request(request)
+    phone = "".join(ch for ch in (req.phone or "") if ch.isdigit())
+    if len(phone) < 9:
+        raise HTTPException(status_code=400, detail="Enter a valid mobile money number.")
+    if req.plan not in gateway.PLANS:
+        raise HTTPException(status_code=400, detail="Unknown plan.")
+    rec = gateway.create_pending(uid, req.plan, phone)
+    res = gateway.initiate(rec)
+    return {"reference": rec["ref"], "amount": rec["amount"],
+            "plan": req.plan, **res}
+
+
+@app.get("/api/pay/status")
+async def api_pay_status(request: Request, reference: str = ""):
+    """Poll after paying — the app calls this until the subscription goes active."""
+    from services.payment_service import gateway
+    from services.auth_service import identity
+    uid = await _uid_from_request(request)
+    rec = gateway.get_payment(reference) or {}
+    if rec and rec.get("uid") != uid:
+        raise HTTPException(status_code=403, detail="Not your payment.")
+    return {"status": rec.get("status", "UNKNOWN"),
+            "subscription": identity.get_subscription(uid)}
+
+
+@app.post("/api/pay/webhook")
+async def api_pay_webhook(request: Request):
+    """Provider callback. Authenticated by shared secret and/or HMAC — never
+    trusted on the strength of its contents alone."""
+    from services.payment_service import gateway
+    raw = await request.body()
+    ok, how = gateway.verify_webhook(dict(request.headers), raw)
+    if not ok:
+        logger.warning(f"[Webhook] rejected: {how}")
+        raise HTTPException(status_code=401, detail="Unauthorized webhook")
+    try:
+        payload = json.loads(raw.decode() or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad JSON")
+    result = gateway.handle_webhook(payload)
+    logger.info(f"[Webhook] verified via {how}: {result}")
+    return result
+
+
+@app.get("/api/admin/grant")
+async def admin_grant(key: str = "", uid: str = "", days: int = 30,
+                      plan: str = "manual"):
+    """Manually activate a user (for payments taken outside the gateway)."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    if not uid:
+        raise HTTPException(status_code=400, detail="uid required")
+    from services.auth_service import identity
+    return identity.grant_subscription(uid, days, plan, payment_ref="manual")
+
+
+@app.get("/api/admin/sub/create")
+async def admin_sub_create(key: str = "", label: str = "", days: int = 30,
+                           owner: bool = False, max_devices: int = 2,
+                           commit: int = 0):
+    """Issue a new subscriber access code. days=0 -> never expires."""
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import subscriptions
+    rec = subscriptions.create_code(label=label, days=days, owner=owner,
+                                    max_devices=max_devices)
+    out = {"created": rec}
+    if commit:
+        out["commit"] = _commit_subs()
+    else:
+        out["warning"] = ("Not yet committed - this code will be LOST on the next "
+                          "redeploy. Call /api/admin/sub/commit?key=... when done "
+                          "issuing codes.")
+    return out
+
+
+@app.get("/api/admin/sub/list")
+async def admin_sub_list(key: str = ""):
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import subscriptions
+    return {"stats": subscriptions.stats(), "codes": subscriptions.list_codes()}
+
+
+@app.get("/api/admin/sub/revoke")
+async def admin_sub_revoke(key: str = "", code: str = "", commit: int = 0):
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    from services.data_service import subscriptions
+    ok = subscriptions.revoke(code)
+    out = {"revoked": ok, "code": code}
+    if commit:
+        out["commit"] = _commit_subs()
+    return out
+
+
+def _commit_subs():
+    """Persist subscriptions.json to GitHub so codes survive redeploys."""
+    try:
+        from services.ml_service import github_commit
+        path = os.path.join(os.path.dirname(__file__), "database", "subscriptions.json")
+        if not os.path.exists(path):
+            return {"error": "no subscriptions.json yet"}
+        from datetime import datetime as _dt
+        return github_commit.commit_files(
+            {"database/subscriptions.json": path},
+            f"Update subscriptions {_dt.utcnow().strftime('%Y-%m-%d %H:%M')}")
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/admin/sub/commit")
+async def admin_sub_commit(key: str = ""):
+    if not INTERNAL_API_KEY or key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Bad or missing ?key=")
+    return _commit_subs()
 
 
 @app.get("/api/admin/status")
