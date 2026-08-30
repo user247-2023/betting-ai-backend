@@ -191,6 +191,28 @@ def fs_set(path: str, data: Dict) -> bool:
     return True
 
 
+def fs_list(collection: str, page_size: int = 200) -> list:
+    """List documents in a collection. Used by the admin payments queue."""
+    tok = _access_token()
+    if not tok:
+        return []
+    url = (f"{_FS_BASE}/projects/{project_id()}/databases/(default)/documents/"
+           f"{collection}?pageSize={int(page_size)}")
+    out = []
+    try:
+        r = requests.get(url, timeout=20, headers={"Authorization": f"Bearer {tok}"})
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        for doc in (r.json().get("documents") or []):
+            rec = {k: _decode(v) for k, v in (doc.get("fields") or {}).items()}
+            rec["_id"] = doc.get("name", "").rsplit("/", 1)[-1]
+            out.append(rec)
+    except Exception:
+        return []
+    return out
+
+
 # ─────────────────────────── subscriptions ───────────────────────────────
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
