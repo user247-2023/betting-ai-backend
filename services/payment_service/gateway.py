@@ -133,6 +133,18 @@ def initiate(rec: Dict) -> Dict:
         except Exception as e:
             return {"ok": False, "message": f"Could not start payment: {e}"}
 
+    if prov == "selcom":
+        from services.payment_service import selcom
+        if not selcom.configured():
+            return {"ok": False, "message": "Selcom is not configured."}
+        res = selcom.push_ussd(rec["ref"], int(rec["amount"]), rec["phone"])
+        if res.get("selcom_reference"):
+            identity.fs_set(_payment_path(rec["ref"]),
+                            {"selcom_reference": res["selcom_reference"],
+                             "updated": _now()})
+        return {"ok": bool(res.get("ok")),
+                "message": res.get("message", "Check your phone to confirm.")}
+
     return {"ok": False, "message": f"Unsupported provider '{prov}'."}
 
 
@@ -144,6 +156,11 @@ def verify_webhook(headers: Dict[str, str], raw_body: bytes) -> Tuple[bool, str]
     body. At least one MUST be configured — an unauthenticated webhook is a
     free-subscription button for anyone who finds the URL.
     """
+    # Selcom signs its callbacks with the same HMAC scheme as its requests
+    if _provider() == "selcom":
+        from services.payment_service import selcom
+        return selcom.verify_webhook(headers, raw_body)
+
     secret = os.getenv("PAYMENTS_WEBHOOK_SECRET", "")
     hmac_key = os.getenv("PAYMENTS_WEBHOOK_HMAC_KEY", "")
     if not (secret or hmac_key):
@@ -172,8 +189,13 @@ def handle_webhook(payload: Dict) -> Dict:
     Idempotent — a repeated delivery for an already-confirmed reference is
     acknowledged without granting a second period.
     """
+    if _provider() == "selcom":
+        from services.payment_service import selcom
+        norm = selcom.parse_webhook(payload)
+        payload = {**payload, "reference": norm["reference"], "status": norm["status"]}
+
     ref = str(payload.get("orderReference") or payload.get("reference")
-              or payload.get("ref") or "").strip()
+              or payload.get("ref") or payload.get("order_id") or "").strip()
     status = str(payload.get("status") or payload.get("paymentStatus") or "").lower()
     if not ref:
         return {"ok": False, "reason": "no_reference"}
@@ -197,6 +219,10 @@ def handle_webhook(payload: Dict) -> Dict:
     except Exception:
         paid = 0.0
     expected = float(rec.get("amount") or 0)
+    # Selcom's callback does not echo the amount; the order was created server
+    # side with the correct figure, so there is nothing for the buyer to alter.
+    if _provider() == "selcom":
+        paid = expected
     if expected and paid and paid + 0.5 < expected:
         identity.fs_set(_payment_path(ref),
                         {"status": "UNDERPAID", "paid": paid, "updated": _now()})
@@ -208,3 +234,42 @@ def handle_webhook(payload: Dict) -> Dict:
     identity.fs_set(_payment_path(ref),
                     {"status": "CONFIRMED", "confirmed_at": _now(), "paid": paid})
     return {"ok": True, "uid": rec["uid"], "plan": plan, "expires": sub["expires"]}
+
+
+# ── Manual reconciliation (used until an aggregator is approved) ─────────
+def list_payments(status: str = "PENDING", limit: int = 100):
+    """Payments awaiting your confirmation, newest first."""
+    rows = identity.fs_list("payments", page_size=limit)
+    if status:
+        rows = [r for r in rows if (r.get("status") or "").upper() == status.upper()]
+    rows.sort(key=lambda r: r.get("created") or "", reverse=True)
+    return rows
+
+
+def approve_manual(ref: str, note: str = "") -> Dict:
+    """Confirm a mobile-money payment you have verified yourself, and activate
+    the subscription. Idempotent — approving twice does not grant twice."""
+    rec = get_payment(ref)
+    if not rec:
+        return {"ok": False, "reason": "unknown_reference"}
+    if rec.get("status") == "CONFIRMED":
+        return {"ok": True, "idempotent": True, "reason": "already_confirmed"}
+
+    plan = rec.get("plan", "monthly")
+    days = PLANS.get(plan, PLANS["monthly"])["days"]
+    sub = identity.grant_subscription(rec["uid"], days, plan, payment_ref=ref)
+    identity.fs_set(_payment_path(ref), {
+        "status": "CONFIRMED", "confirmed_at": _now(),
+        "confirmed_by": "manual", "admin_note": note or "",
+    })
+    return {"ok": True, "uid": rec["uid"], "plan": plan,
+            "expires": sub["expires"], "amount": rec.get("amount")}
+
+
+def reject_manual(ref: str, reason: str = "") -> Dict:
+    rec = get_payment(ref)
+    if not rec:
+        return {"ok": False, "reason": "unknown_reference"}
+    identity.fs_set(_payment_path(ref), {
+        "status": "REJECTED", "updated": _now(), "admin_note": reason or ""})
+    return {"ok": True, "ref": ref}
