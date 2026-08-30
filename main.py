@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Rate limiting — fault-tolerant import
 try:
@@ -162,7 +162,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["POST", "GET", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    # X-Access-Code / X-Device-Id are sent by the app; omitting them here makes
+    # the browser's CORS preflight fail before the request ever reaches us,
+    # which surfaces in the UI as "Couldn't load premium tips".
+    allow_headers=["Content-Type", "Authorization", "X-API-Key",
+                   "X-Access-Code", "X-Device-Id"],
 )
 
 # Goals-market router (Dixon-Coles model, value detection, CLV) — Tier 1-3
@@ -1087,6 +1091,39 @@ async def api_curated(request: Request, tier: str = "1.20", date: str = ""):
     return content.get_curated(d, content.normalise_tier(tier))
 
 
+@app.get("/api/admin/payments")
+async def admin_payments(request: Request, key: str = "", status: str = "PENDING"):
+    """Payments waiting for you to confirm against your mobile-money messages."""
+    _require_admin(request, key)
+    from services.payment_service import gateway
+    rows = gateway.list_payments(status=status)
+    return {"status": status, "count": len(rows),
+            "payments": [{
+                "ref": r.get("ref"), "uid": r.get("uid"), "plan": r.get("plan"),
+                "amount": r.get("amount"), "phone": r.get("phone"),
+                "created": r.get("created"), "provider": r.get("provider"),
+            } for r in rows]}
+
+
+@app.get("/api/admin/payments/approve")
+async def admin_payment_approve(request: Request, key: str = "", ref: str = "", note: str = ""):
+    """Confirm a payment you have verified and activate the subscription."""
+    _require_admin(request, key)
+    if not ref:
+        raise HTTPException(status_code=400, detail="ref required")
+    from services.payment_service import gateway
+    return gateway.approve_manual(ref, note)
+
+
+@app.get("/api/admin/payments/reject")
+async def admin_payment_reject(request: Request, key: str = "", ref: str = "", reason: str = ""):
+    _require_admin(request, key)
+    if not ref:
+        raise HTTPException(status_code=400, detail="ref required")
+    from services.payment_service import gateway
+    return gateway.reject_manual(ref, reason)
+
+
 @app.get("/api/admin/curated/list")
 async def admin_curated_list(request: Request, key: str = "", tier: str = "1.20", date: str = ""):
     _require_admin(request, key)
@@ -1256,6 +1293,122 @@ async def api_pay_status(request: Request, reference: str = ""):
         raise HTTPException(status_code=403, detail="Not your payment.")
     return {"status": rec.get("status", "UNKNOWN"),
             "subscription": identity.get_subscription(uid)}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  SELCOM C2B CALLBACKS
+#  Selcom calls these three while collecting a payment. They are
+#  authenticated with a bearer token we issue (SELCOM_C2B_TOKEN),
+#  and must answer in Selcom's result envelope.
+#  NOTE: a failure or timeout on /validation AUTO-REVERSES the
+#  customer's money, so it stays fast and never raises.
+# ══════════════════════════════════════════════════════════════════
+async def _selcom_guard(request: Request):
+    from services.payment_service import selcom
+    ok, how = selcom.verify_callback(dict(request.headers))
+    if not ok:
+        logger.warning(f"[Selcom] callback rejected: {how}")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        return await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Bad JSON")
+
+
+def _selcom_check(payload):
+    """Shared checks for lookup and validation."""
+    from services.payment_service import selcom, gateway
+    ref = str(payload.get("utilityref") or "").strip()
+    sel_ref = str(payload.get("reference") or "")
+    rec = gateway.get_payment(ref) if ref else None
+    if not rec:
+        return None, selcom.reply(sel_ref, selcom.ERR_BAD_REFERENCE,
+                                  "Unknown payment reference")
+    if rec.get("status") == "CONFIRMED":
+        return rec, selcom.reply(sel_ref, selcom.ERR_BAD_REFERENCE,
+                                 "This reference is already paid")
+    if payload.get("amount") not in (None, ""):
+        try:
+            paid, want = float(payload["amount"]), float(rec.get("amount") or 0)
+        except (TypeError, ValueError):
+            return rec, selcom.reply(sel_ref, selcom.ERR_BAD_AMOUNT, "Invalid amount")
+        if want:
+            if paid + 0.5 < want:
+                return rec, selcom.reply(sel_ref, selcom.ERR_AMOUNT_LOW,
+                                         f"Amount too low, expected {int(want)}")
+            if paid > want + 0.5:
+                return rec, selcom.reply(sel_ref, selcom.ERR_AMOUNT_HIGH,
+                                         f"Amount too high, expected {int(want)}")
+    return rec, None
+
+
+@app.post("/api/selcom/lookup")
+async def selcom_lookup(request: Request):
+    """Selcom asks whether this reference is payable, before charging."""
+    from services.payment_service import selcom
+    payload = await _selcom_guard(request)
+    try:
+        rec, err = _selcom_check(payload)
+        if err:
+            return err
+        return selcom.reply(str(payload.get("reference") or ""), selcom.OK,
+                            "Rollover subscription",
+                            name="Rollover subscription",
+                            amount=str(int(rec.get("amount") or 0)))
+    except Exception as e:
+        logger.warning(f"[Selcom] lookup error: {e}")
+        return selcom.reply(str(payload.get("reference") or ""),
+                            selcom.ERR_GENERAL, "Temporary error")
+
+
+@app.post("/api/selcom/validation")
+async def selcom_validation(request: Request):
+    """Final pre-debit check. Anything other than 000 reverses the payment."""
+    from services.payment_service import selcom
+    payload = await _selcom_guard(request)
+    try:
+        rec, err = _selcom_check(payload)
+        if err:
+            return err
+        return selcom.reply(str(payload.get("reference") or ""), selcom.OK, "Accepted")
+    except Exception as e:
+        logger.warning(f"[Selcom] validation error: {e}")
+        return selcom.reply(str(payload.get("reference") or ""),
+                            selcom.ERR_GENERAL, "Temporary error")
+
+
+@app.post("/api/selcom/notification")
+async def selcom_notification(request: Request):
+    """Payment confirmed — activate the subscription. Idempotent."""
+    from services.payment_service import selcom, gateway
+    from services.auth_service import identity
+    payload = await _selcom_guard(request)
+    sel_ref = str(payload.get("reference") or "")
+    try:
+        ref = str(payload.get("utilityref") or "").strip()
+        rec = gateway.get_payment(ref) if ref else None
+        if not rec:
+            return selcom.reply(sel_ref, selcom.ERR_BAD_REFERENCE, "Unknown reference")
+
+        if rec.get("status") == "CONFIRMED":
+            return selcom.reply(sel_ref, selcom.OK, "Already processed")
+
+        plan = rec.get("plan", "monthly")
+        days = gateway.PLANS.get(plan, gateway.PLANS["monthly"])["days"]
+        sub = identity.grant_subscription(rec["uid"], days, plan, payment_ref=ref)
+        identity.fs_set(f"payments/{ref}", {
+            "status": "CONFIRMED",
+            "confirmed_at": datetime.now(timezone.utc).isoformat(),
+            "confirmed_by": "selcom",
+            "selcom_reference": sel_ref,
+            "selcom_transid": str(payload.get("transid") or ""),
+            "operator": str(payload.get("operator") or ""),
+        })
+        logger.info(f"[Selcom] {ref} confirmed -> {rec['uid']} until {sub['expires']}")
+        return selcom.reply(sel_ref, selcom.OK, "Subscription activated")
+    except Exception as e:
+        logger.error(f"[Selcom] notification error: {e}")
+        return selcom.reply(sel_ref, selcom.ERR_GENERAL, "Temporary error")
 
 
 @app.post("/api/pay/webhook")
